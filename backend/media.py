@@ -21,7 +21,11 @@ import re
 import shutil
 from pathlib import Path
 
+import httpx
 from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+
+import keyframes
+from engine import container_key
 
 # ---------------------------------------------------------------------------
 # Binary resolution (lazy so tests can run with only the bundled binary)
@@ -118,7 +122,8 @@ async def probe_media(file_id: str, token: str, drive_api_base: str) -> dict:
             timeout=90,
         )
         if rc == 0 and out.strip().startswith("{"):
-            return normalize_ffprobe(json.loads(out), file_id)
+            return await enrich_probe(normalize_ffprobe(json.loads(out), file_id),
+                                      token, drive_api_base)
         # fall through to the ffmpeg parser rather than dying outright
 
     ff = ffmpeg_bin()
@@ -134,6 +139,46 @@ async def probe_media(file_id: str, token: str, drive_api_base: str) -> dict:
     info = parse_ffmpeg_stderr(err, file_id)
     if info["video"] is None and not info["audio"] and not info["subtitles"]:
         raise ProbeError(f"could not parse any streams. ffmpeg said: {err[-400:]}")
+    return await enrich_probe(info, token, drive_api_base)
+
+
+async def enrich_probe(info: dict, token: str, drive_api_base: str) -> dict:
+    """
+    MediaInfo v2 (docs/ARCHITECTURE.md §4): canonical container + keyframe
+    time index, built from a handful of Range reads — never a full-file scan.
+    Best-effort: index failures leave source="none" and never fail the probe.
+    """
+    info["container"] = container_key(info.get("format_name", ""))
+    size = info.get("size") or 0
+    info["keyframes"] = {"source": "none", "count": 0, "times": [],
+                         "error": None, "moov_position": None,
+                         "fragmented": False, "encrypted": False}
+    if size and info["container"] in ("mp4", "mov", "mkv"):
+        async def fetch(start: int, end: int) -> bytes:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=15.0, read=60.0, write=30.0,
+                                      pool=30.0),
+            ) as client:
+                resp = await client.get(
+                    media_url(drive_api_base, info["file_id"]),
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept-Encoding": "identity",
+                        "Range": f"bytes={start}-{end}",
+                    },
+                )
+                if resp.status_code >= 400:
+                    raise ProbeError(f"range read failed: HTTP {resp.status_code}")
+                return resp.content
+
+        try:
+            info["keyframes"] = await asyncio.wait_for(
+                keyframes.build_keyframe_index(info, fetch, size), timeout=120)
+        except (asyncio.TimeoutError, ProbeError, Exception) as e:  # noqa: BLE001
+            info["keyframes"] = {"source": "none", "count": 0, "times": [],
+                                 "error": str(e)[:200], "moov_position": None,
+                                 "fragmented": False, "encrypted": False}
     return info
 
 
@@ -144,10 +189,16 @@ def normalize_ffprobe(raw: dict, file_id: str) -> dict:
     except ValueError:
         duration = 0.0
 
+    try:
+        size = int(float(fmt.get("size") or 0))
+    except ValueError:
+        size = 0
+
     info = {
         "file_id": file_id,
         "format_name": fmt.get("format_name", ""),
         "duration": duration,
+        "size": size,
         "video": None,
         "audio": [],
         "subtitles": [],
@@ -188,6 +239,7 @@ def parse_ffmpeg_stderr(text: str, file_id: str) -> dict:
         "file_id": file_id,
         "format_name": "",
         "duration": 0.0,
+        "size": 0,
         "video": None,
         "audio": [],
         "subtitles": [],
