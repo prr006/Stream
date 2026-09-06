@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local secrets — NEVER commit these
+.env
+token.json

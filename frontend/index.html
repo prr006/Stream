@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stream POC</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 960px; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 1.5rem; }
+  ul { list-style: none; padding: 0; max-height: 240px; overflow-y: auto; border: 1px solid #ccc; border-radius: 6px; }
+  li { padding: .45rem .6rem; border-bottom: 1px solid #eee; }
+  li:last-child { border-bottom: 0; }
+  li a { text-decoration: none; color: #0b57d0; }
+  li small { color: #777; margin-left: .5rem; }
+  video { width: 100%; background: #000; border-radius: 6px; margin-top: .5rem; }
+  button { margin-right: .4rem; padding: .3rem .7rem; }
+  #banner { padding: .6rem .8rem; border-radius: 6px; background: #f1f3f4; }
+  #banner.ok { background: #e6f4ea; }
+  #status { font-size: .85rem; color: #555; }
+  #now-playing { font-weight: 600; }
+  input { padding: .35rem .5rem; margin-bottom: .5rem; }
+</style>
+</head>
+<body>
+
+<h1>Google Drive &rarr; backend &rarr; browser (POC)</h1>
+
+<div id="banner">checking authorization&hellip;</div>
+
+<h2>1. Pick a video from your Drive</h2>
+<input id="filter" placeholder="filter by name&hellip;" size="32">
+<ul id="files"></ul>
+
+<h2>2. Play / seek</h2>
+<p id="now-playing"></p>
+<video id="player" controls preload="metadata"></video>
+<p>
+  Seek to:
+  <button data-jump="0.25">25%</button>
+  <button data-jump="0.50">50%</button>
+  <button data-jump="0.90">90%</button>
+  <span id="status"></span>
+</p>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const video = $("#player");
+const escapeHtml = (s) => s.replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+
+async function main() {
+  const status = await (await fetch("/auth/status")).json();
+  if (!status.authorized) {
+    $("#banner").innerHTML =
+      'Not authorized. <a href="/auth/login">Sign in with Google</a> to list and stream your videos.';
+    return;
+  }
+  $("#banner").className = "ok";
+  $("#banner").innerHTML = 'Authorized with Google Drive. (<a href="/auth/logout">log out</a>)';
+
+  const res = await fetch("/files");
+  if (res.status === 401) {
+    $("#banner").innerHTML =
+      'Session expired. <a href="/auth/login">Re-authorize with Google</a>.';
+    return;
+  }
+  const data = await res.json();
+  const all = data.files || [];
+  render(all);
+  $("#filter").addEventListener("input", (e) => {
+    const q = e.target.value.toLowerCase();
+    render(all.filter(f => f.name.toLowerCase().includes(q)));
+  });
+}
+
+function render(files) {
+  $("#files").innerHTML = files.length
+    ? files.map(f => {
+        const size = f.size ? (f.size / 1048576).toFixed(1) + " MB" : "?";
+        return `<li><a href="#" data-id="${f.id}">${escapeHtml(f.name)}</a>
+                <small>${escapeHtml(f.mimeType)} &middot; ${size}</small></li>`;
+      }).join("")
+    : "<li><small>No video files found in this Drive account.</small></li>";
+
+  document.querySelectorAll("#files a").forEach(a =>
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      play(a.dataset.id, a.textContent);
+    }));
+}
+
+function play(id, name) {
+  video.src = `/stream/${id}`;
+  $("#now-playing").textContent = name;
+  video.play().catch(() => {}); // autoplay may be blocked; user can press play
+}
+
+document.querySelectorAll("[data-jump]").forEach(btn =>
+  btn.addEventListener("click", () => {
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      video.currentTime = video.duration * parseFloat(btn.dataset.jump);
+    }
+  }));
+
+// Event log proves buffering/seeking: watch for "seeking" followed by new
+// network reads, and "buffered to Xs" advancing without the page reloading.
+for (const ev of ["loadedmetadata","seeking","seeked","waiting","canplay","progress","stalled","error"]) {
+  video.addEventListener(ev, () => {
+    const bufferedEnd = video.buffered.length
+      ? video.buffered.end(video.buffered.length - 1).toFixed(1) : "0.0";
+    $("#status").textContent =
+      `event: ${ev} | now ${video.currentTime.toFixed(1)}s | buffered to ${bufferedEnd}s`;
+    if (ev === "error" && video.error) {
+      $("#status").textContent += ` (media error code ${video.error.code}: ${video.error.message || "unknown"})`;
+    }
+  });
+}
+
+main();
+</script>
+</body>
+</html>
