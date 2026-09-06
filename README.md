@@ -17,12 +17,20 @@ whole file first**.
 Stream/
 ├── backend/
 │   ├── app.py            # OAuth + /files + /stream (range proxy) + /probe + /subtitles + /remux
+│   │                     #   + /media/{id}/plan  ◀── the media-engine entry point
+│   ├── engine.py         # Pure decision ladder: decide(probe, caps) → playback plan
 │   ├── media.py          # ffprobe/ffmpeg probing, subtitle→WebVTT, remux, local ranged serving
 │   ├── fetch_vendor.py   # downloads pinned mediabunny + ffmpeg.wasm into frontend/vendor/
 │   ├── requirements.txt  # fastapi, uvicorn, httpx, python-dotenv, imageio-ffmpeg
 │   └── .env.example      # copy to .env and fill in your OAuth client credentials
 ├── frontend/
-│   ├── index.html        # file picker + player + seek buttons + subtitles + WASM/remux panels
+│   ├── index.html        # thin shell (NO codec logic in pages)
+│   ├── app.js            # page layer: renders plan, wires hooks to DOM
+│   ├── media/
+│   │   ├── engine.js         # MediaEngine: measure caps → POST /media/plan → session
+│   │   ├── capabilities.js   # measured browser capability matrix (canPlayType/MSE/MediaCap)
+│   │   ├── adapters.js       # one adapter per delivery mode, uniform mount/dispose contract
+│   │   └── subtitles.js      # SubtitleManager (owns <track> elements + showing modes)
 │   ├── ac3-audio.js      # AC3 WASM player (demux→decode→schedule→sync engine, DOM-free class)
 │   └── vendor/           # mediabunny + ffmpeg-core wasm (gitignored; run fetch_vendor.py)
 ├── tests/
@@ -106,6 +114,31 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
    #          content-range: bytes 1000000-1000099/<total-size>
    ```
 
+## 5b. Architecture: the media engine (milestone 3)
+
+MyStream is organized around a **Direct Play ladder** — the browser gets the
+original bytes whenever it can play them, and the system picks the **minimum
+intervention mode** for each file:
+
+1. `direct-play` — original bytes, browser decodes everything (shipped)
+2. `wasm-audio` — original bytes; AC3/E-AC3 decoded in-browser by WASM (shipped)
+3. `container-remux` — codecs fine, container wrong → copy-only rewrap (modeled)
+4. `audio-remux` — audio→AAC once server-side; video bitstream copied (shipped)
+5. `transcode` — full video re-encode, absolute last resort (unimplemented)
+
+Flow: the browser **measures its capabilities** (canPlayType/MSE/Media
+Capabilities) → `POST /media/{id}/plan` → the backend's **pure decision
+function** (`engine.py`, fully unit-tested) returns a plan with `mode`,
+`reasons`, per-stream `steps`, track-level capability flags, subtitle urls and
+`alternatives[]` fallbacks → the frontend media layer
+(`frontend/media/engine.js` + adapters) mounts the right playback strategy →
+the page just renders what the plan says. **Pages contain zero codec logic.**
+
+Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — and the required
+"can an existing OSS engine do this?" evaluation (mediabunny / ffmpeg.wasm /
+libav.js / hls.js / Jellyfin's model) is in
+[docs/EVALUATION.md](docs/EVALUATION.md).
+
 ## 6. Automated test (no Google credentials needed)
 
 ```bash
@@ -118,7 +151,8 @@ requests come back byte-exact with `206` + `Content-Range`, plus that the auth g
 ```bash
 python tests/test_subtitles.py       # MKV probe + subtitle extraction
 python tests/test_remux.py           # audio-only AAC remux (HEVC copied, AC3->AAC)
-python tests/test_wasm_audio.py      # browser WASM AC3 pipeline via Node, class-level engine tests incl. storm guards (needs vendor fetch first)
+python tests/test_wasm_audio.py      # WASM AC3 pipeline: class-level engine tests incl. storm guards
+python tests/test_media_engine.py    # decision ladder matrix + /media/{id}/plan endpoint + JS layer
 ```
 
 Unit-tests the ffprobe/ffmpeg stream parsers, then synthesizes a **real MKV with two embedded

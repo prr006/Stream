@@ -2,16 +2,17 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Stream POC</title>
+<title>MyStream POC</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 960px; padding: 0 1rem; }
   h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 1.5rem; }
-  ul { list-style: none; padding: 0; max-height: 240px; overflow-y: auto; border: 1px solid #ccc; border-radius: 6px; }
-  li { padding: .45rem .6rem; border-bottom: 1px solid #eee; }
-  li:last-child { border-bottom: 0; }
-  li a { text-decoration: none; color: #0b57d0; }
-  li small { color: #777; margin-left: .5rem; }
+  ul { list-style: none; padding: 0; }
+  #files { max-height: 240px; overflow-y: auto; border: 1px solid #ccc; border-radius: 6px; }
+  #files li { padding: .45rem .6rem; border-bottom: 1px solid #eee; }
+  #files li:last-child { border-bottom: 0; }
+  #files li a { text-decoration: none; color: #0b57d0; }
+  #files li small { color: #777; margin-left: .5rem; }
   video { width: 100%; background: #000; border-radius: 6px; margin-top: .5rem; }
   button { margin-right: .4rem; padding: .3rem .7rem; }
   #banner { padding: .6rem .8rem; border-radius: 6px; background: #f1f3f4; }
@@ -20,11 +21,14 @@
   #now-playing { font-weight: 600; }
   input[type=text] { padding: .35rem .5rem; margin-bottom: .5rem; }
   .panel { font-size: .9rem; border: 1px solid #ddd; border-radius: 6px; padding: .6rem .8rem; margin-top: .5rem; }
-  .panel .warn { color: #b3261e; }
+  .warn { color: #b3261e; }
   .panel code { background: #f1f3f4; padding: 0 .3rem; border-radius: 3px; }
-  panel label, #subs label { display: block; padding: .2rem 0; }
+  #subs label { display: block; padding: .2rem 0; }
   #subs .unsupported { color: #888; }
   #subs button { font-size: .75rem; padding: .1rem .4rem; margin-left: .4rem; }
+  #wasm-stats { color:#555; margin-top:.3rem; font-family:monospace; font-size:.8rem; }
+  #wasm-diag { font-family:monospace; font-size:.72rem; color:#333; white-space:pre-wrap; margin-top:.25rem; }
+  #wasm-error { color:#b3261e; font-size:.8rem; margin-top:.2rem; }
   #diag { font-size: .75rem; background: #111; color: #0f0; padding: .5rem .7rem;
           border-radius: 6px; white-space: pre-wrap; margin-top: .5rem; max-height: 220px; overflow-y: auto; }
   details { margin-top: 1rem; }
@@ -32,7 +36,7 @@
 </head>
 <body>
 
-<h1>Google Drive &rarr; backend &rarr; browser (MKV + subtitles POC)</h1>
+<h1>MyStream — Drive-backed media server POC (media-engine architecture)</h1>
 
 <div id="banner">checking authorization&hellip;</div>
 
@@ -51,9 +55,16 @@
   <span id="status"></span>
 </p>
 
-<div id="detect" class="panel" hidden></div>
-<div id="wasm" class="panel" hidden></div>
-<div id="audiofix" class="panel" hidden></div>
+<div id="plan" class="panel" hidden>
+  <div id="wasm-bits" hidden>
+    <button id="wasm-tone" title="440 Hz blip through the exact WASM output chain — audible tone + silent movie ⇒ fault is demux/decode, not WebAudio">440 Hz test tone</button>
+    <div id="wasm-stats"></div>
+    <div id="wasm-error"></div>
+    <div id="wasm-diag"></div>
+  </div>
+</div>
+<div id="info" class="panel" hidden></div>
+<div id="remux" class="panel" hidden></div>
 <div id="subs" class="panel" hidden></div>
 
 <details>
@@ -61,406 +72,6 @@
   <div id="diag">no track data yet</div>
 </details>
 
-<script>
-const $ = (s) => document.querySelector(s);
-const video = $("#player");
-const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
-const el = (tag, text) => { const e = document.createElement(tag); e.textContent = text; return e; };
-
-let currentFileId = null;
-let pollTimer = null;
-let wasmCtl = null;   // Ac3WasmAudio instance while enabled
-
-/* ---------------- file list / auth ---------------- */
-
-async function main() {
-  const status = await (await fetch("/auth/status")).json();
-  if (!status.authorized) {
-    $("#banner").innerHTML =
-      'Not authorized. <a href="/auth/login">Sign in with Google</a>.';
-    return;
-  }
-  $("#banner").className = "ok";
-  $("#banner").innerHTML = 'Authorized with Google Drive. (<a href="/auth/logout">log out</a>)';
-
-  const res = await fetch("/files");
-  if (res.status === 401) {
-    $("#banner").innerHTML = 'Session expired. <a href="/auth/login">Re-authorize</a>.';
-    return;
-  }
-  const data = await res.json();
-  const all = data.files || [];
-  render(all);
-  $("#filter").addEventListener("input", (e) => {
-    const q = e.target.value.toLowerCase();
-    render(all.filter(f => f.name.toLowerCase().includes(q)));
-  });
-}
-
-function render(files) {
-  $("#files").innerHTML = files.length
-    ? files.map(f => {
-        const size = f.size ? (f.size / 1048576).toFixed(1) + " MB" : "?";
-        return `<li><a href="#" data-id="${f.id}">${escapeHtml(f.name)}</a>
-                <small>${escapeHtml(f.mimeType)} &middot; ${size}</small></li>`;
-      }).join("")
-    : "<li><small>No video files found in this Drive account.</small></li>";
-  document.querySelectorAll("#files a").forEach(a =>
-    a.addEventListener("click", (e) => { e.preventDefault(); play(a.dataset.id, a.textContent); }));
-}
-
-function play(id, name) {
-  currentFileId = id;
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
-  video.muted = false;
-  clearSubs();
-  ["#detect", "#wasm", "#audiofix", "#subs"].forEach(s => { $(s).hidden = true; });
-  video.src = `/stream/${id}`;
-  $("#now-playing").textContent = name;
-  video.play().catch(() => {});
-  probe(id);
-}
-
-/* ---------------- probing / detection ---------------- */
-
-async function probe(id) {
-  const box = $("#detect");
-  box.hidden = false;
-  box.textContent = "Probing container/codec/subtitle streams via /probe ...";
-  let info;
-  try {
-    const res = await fetch(`/probe/${id}`);
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    info = await res.json();
-  } catch (e) {
-    box.innerHTML = `<span class="warn"></span>`;
-    box.querySelector(".warn").textContent = `Probe failed: ${e.message}`;
-    return;
-  }
-  renderDetection(info);
-  renderSubtitles(info);
-  setupWasmAudio(id, info);
-  if (info.playability.needs_audio_remux) setupAudioFix(id);
-}
-
-/* ---------------- WASM AC3 audio (V0) ---------------- */
-
-function setupWasmAudio(id, info) {
-  const box = $("#wasm");
-  const hasAc3 = (info.audio || []).some(a => /^(ac3|eac3)$/i.test(a.codec || ""));
-  if (!hasAc3) { box.hidden = true; return; }
-  box.hidden = false;
-
-  const title = el("b", "WASM AC3 audio (experimental v0): ");
-  const btn = el("button", "Enable");
-  const tone = el("button", "440 Hz test tone");
-  tone.disabled = true;
-  tone.title = "Drives the exact same output chain (gain → destination) with a pure tone. Audible tone + silent movie ⇒ fault is demux/decode, not WebAudio.";
-  const desc = el("span",
-    "browser-side AC3 decode (original bytes from /stream, no remux, no full download — bounded buffer). Video element stays muted.");
-  const stats = el("div", "");
-  stats.style.cssText = "color:#555;margin-top:.3rem;font-family:monospace;font-size:.8rem";
-  const diag = el("div", "");
-  diag.style.cssText = "font-family:monospace;font-size:.72rem;color:#333;white-space:pre-wrap;margin-top:.25rem";
-  const errLine = el("div", "");
-  errLine.style.cssText = "color:#b3261e;font-size:.8rem;margin-top:.2rem";
-  box.replaceChildren(title, btn, tone, desc, stats, errLine, diag);
-
-  let diagTimer = null;
-  const fmtN = (x) => x == null ? "?" : Number(x).toFixed(2) + "s";
-  const showDiag = () => {
-    if (!wasmCtl) { diag.textContent = ""; return; }
-    const d = wasmCtl.getDiagnostics();
-    diag.textContent =
-      `ctx=${d.ctxState} ${d.sampleRate}Hz | pcm=${d.pcmFormat} | ` +
-      `video.t=${fmtN(d.videoT)} audio≈${fmtN(d.audioEstT)} ` +
-      `drift=${d.driftMs == null ? "?" : d.driftMs.toFixed(0) + "ms"}(streak ${d.driftStreak}) ` +
-      `vrs=${d.readyState} | ` +
-      `buffers: started=${d.buffersStarted} pending=${d.scheduledPending} ` +
-      `nextStartLead=${d.nextStartLeadS == null ? "?" : d.nextStartLeadS.toFixed(2) + "s"} | ` +
-      `horizon=${d.horizonS == null ? "?" : d.horizonS.toFixed(1) + "s"} | ` +
-      `rms=${d.rms.toFixed(3)} peak=${d.peak.toFixed(3)} decoded=${d.decodedS.toFixed(1)}s | ` +
-      `pkts=${d.packets} fetched=${(d.bytesFetched / 1048576).toFixed(2)}MB | ` +
-      `video.muted=${d.videoMuted} gain=${d.gainValue}${d.eof ? " | EOF" : ""}`;
-  };
-
-  tone.onclick = () => wasmCtl?.testTone(1.5);
-
-  btn.onclick = async () => {
-    if (wasmCtl) {            // toggle off
-      wasmCtl.dispose(); wasmCtl = null;
-      clearInterval(diagTimer); diagTimer = null;
-      video.muted = false;
-      tone.disabled = true;
-      btn.textContent = "Enable";
-      stats.textContent = "disabled."; diag.textContent = ""; errLine.textContent = "";
-      return;
-    }
-    btn.disabled = true;
-    errLine.textContent = "";
-    stats.textContent = "loading mediabunny + ffmpeg-core.wasm (~32MB, one-time)…";
-    try {
-      const mod = await import("/static/ac3-audio.js");
-      wasmCtl = new mod.Ac3WasmAudio(video, id, {
-        log: (m) => console.log("[ac3wasm]", m),
-        onStats: (s) => {
-          stats.textContent =
-            `decoded ${s.decodedS.toFixed(1)}s · packets ${s.packets} · ` +
-            `horizon ${s.horizonS.toFixed(1)}s · decode ${s.decMs} ms/chunk · ` +
-            `rms ${s.rms.toFixed(3)} peak ${s.peak.toFixed(3)}` + (s.eof ? " · EOF" : "");
-        },
-        onError: (m) => {
-          errLine.textContent = "pipeline error: " + m;
-          console.error("[ac3wasm]", m);
-        },
-      });
-      await wasmCtl.init();
-      wasmCtl.attach();
-      video.muted = true;              // native AC3 track is silent/undecodable
-      btn.disabled = false;
-      btn.textContent = "Disable";
-      tone.disabled = false;
-      wasmCtl.testTone(0.8);           // 440 Hz blip proves the output chain immediately
-      stats.textContent = "active — press Play. If the tone was silent, the problem is WebAudio output, not AC3.";
-      diagTimer = setInterval(showDiag, 500);
-      if (!video.paused) wasmCtl.resumeFrom(video.currentTime);
-    } catch (e) {
-      errLine.textContent = "init failed: " + (e?.message || e);
-      btn.disabled = false;
-      if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
-      video.muted = false;
-    }
-  };
-}
-
-function renderDetection(info) {
-  const p = info.playability;
-  const rows = [];
-  const push = (html) => { const d = document.createElement("div"); d.innerHTML = html; rows.push(d); };
-  const pushWarn = (text) => { const d = el("div", "⚠ " + text); d.className = "warn"; rows.push(d); };
-
-  const dur = info.duration ? (info.duration / 60).toFixed(0) + " min" : "?";
-  push(`<b>Container:</b> <code>${escapeHtml(p.container || "?")}</code> · duration ${dur} (via ${escapeHtml(info.probe_engine)})`);
-  if (info.video) push(`<b>Video:</b> <code>${escapeHtml(info.video.codec)}</code> ${info.video.width || "?"}x${info.video.height || "?"}`);
-  push(`<b>Audio:</b> ${info.audio.map(a => `<code>${escapeHtml(a.codec)}</code> (${escapeHtml(a.language)})`).join(", ") || "none"}`);
-  pushWarnFree(rows, p.browser_note);
-  if (info.format_name.includes("matroska")) {
-    const cpt = video.canPlayType('video/x-matroska');
-    if (cpt === "") pushWarn("This browser reports no MKV support in <video>. Use Chrome/Edge.");
-    else push(`This browser's MKV check: <code>${escapeHtml(cpt)}</code>`);
-  }
-  (p.warnings || []).forEach(pushWarn);
-
-  const box = $("#detect");
-  box.replaceChildren(...rows);
-}
-function pushWarnFree(rows, text) {
-  const d = el("div", text); rows.push(d);
-}
-
-/* ---------------- subtitles ---------------- */
-
-function clearSubs() {
-  video.querySelectorAll("track").forEach(t => t.remove());
-}
-
-function renderSubtitles(info) {
-  const box = $("#subs");
-  box.hidden = false;
-  const subs = info.subtitles || [];
-  const frag = document.createDocumentFragment();
-  frag.appendChild(el("h2", "3. Subtitles (embedded tracks → WebVTT)"));
-  if (!subs.length) {
-    frag.appendChild(el("em", "No embedded subtitle tracks detected."));
-    box.replaceChildren(frag);
-    return;
-  }
-
-  let firstCompatible = true;
-  subs.forEach((t) => {
-    const label = t.title || t.language || `stream ${t.index}`;
-
-    if (!t.web_compatible) {
-      const d = el("div", `✗ ${label} (${t.codec} — ${t.note || "unsupported"})`);
-      d.className = "unsupported";
-      frag.appendChild(d);
-      return;
-    }
-
-    // <track> element: the browser fetches our /subtitles/*.vtt and renders cues.
-    const trackEl = document.createElement("track");
-    trackEl.kind = "subtitles";
-    trackEl.src = t.url;                       // e.g. /subtitles/<id>/3.vtt
-    trackEl.srclang = (t.language && t.language !== "und") ? t.language : "en";
-    trackEl.label = label;
-    if (firstCompatible) { trackEl.default = true; }
-    video.appendChild(trackEl);                // MUST be in the DOM to load
-
-    const row = document.createElement("label");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = firstCompatible;
-    firstCompatible = false;
-    const note = el("small", "");
-    note.style.color = "#777";
-    const jumpBtn = el("button", "jump to first cue");
-    jumpBtn.style.display = "none";
-    row.appendChild(cb);
-    row.appendChild(document.createTextNode(` ${label} (${t.codec}, ${trackEl.srclang})`));
-    row.appendChild(note);
-    row.appendChild(jumpBtn);
-    frag.appendChild(row);
-
-    const apply = () => {
-      // THE critical line: mode must be "showing" to render, "disabled" when off.
-      trackEl.track.mode = cb.checked ? "showing" : "disabled";
-      updateDiag();
-    };
-    cb.addEventListener("change", apply);
-
-    trackEl.addEventListener("load", () => {
-      note.textContent = cb.checked ? "" : " (loaded, off)";
-      note.style.color = "#777";
-      const cues = trackEl.track.cues;
-      if (cues && cues.length) {
-        jumpBtn.style.display = "";
-        jumpBtn.onclick = () => {
-          video.currentTime = cues[0].startTime + 0.05;
-          if (!cb.checked) { cb.checked = true; apply(); }
-          video.play().catch(() => {});
-        };
-      }
-      apply();   // re-assert mode after load (some builds reset it)
-      updateDiag();
-    });
-    trackEl.addEventListener("error", () => {
-      note.textContent = " (track ERROR — see diagnostics below; likely bad headers/parse)";
-      note.style.color = "#b3261e";
-      updateDiag();
-    });
-
-    note.textContent = cb.checked
-      ? " (extracting/first load can take a while…)" : " (off)";
-    apply();
-  });
-
-  box.replaceChildren(frag);
-  setTimeout(updateDiag, 1500);
-}
-
-/* ---------------- diagnostics ---------------- */
-
-const READY = ["NONE", "LOADING", "LOADED", "ERROR"];
-
-function updateDiag() {
-  const lines = [];
-  lines.push(`video.src               : ${video.currentSrc || "(none)"}`);
-  lines.push(`media time/duration     : ${fmtT(video.currentTime)} / ${fmtT(video.duration)}`);
-  lines.push(`video.textTracks.length : ${video.textTracks.length}`);
-  const trackEls = [...video.querySelectorAll("track")];
-  video.textTracks.length && trackEls.forEach((elm, i) => {
-    const tr = elm.track;
-    const cues = tr.cues ? tr.cues.length : 0;
-    const first = cues ? fmtT(tr.cues[0].startTime) : "-";
-    lines.push(
-      `[${i}] ${elm.label || elm.srclang}: readyState=${elm.readyState} (${READY[elm.readyState]}), ` +
-      `mode=${tr.mode}, cues=${cues}, first-cue@${first}, src=${elm.src}`);
-  });
-  if (!trackEls.length) lines.push("(no <track> elements attached)");
-  lines.push("");
-  lines.push("How to read: readyState LOADED + cues>0 + mode=showing => cues SHOULD render.");
-  lines.push("readyState ERROR => fetch ok or not, but parsing/header/CORS failed (check Network).");
-  $("#diag").textContent = lines.join("\n");
-}
-const fmtT = (s) => Number.isFinite(s) ? s.toFixed(1) + "s" : "?";
-["loadedmetadata", "seeked", "play"].forEach(ev => video.addEventListener(ev, updateDiag));
-
-/* ---------------- audio-only AAC remux ---------------- */
-
-async function setupAudioFix(id) {
-  const box = $("#audiofix");
-  box.hidden = false;
-  const res = await fetch(`/remux/${id}/status`);
-  const st = await res.json();
-  renderAudioFix(id, st);
-}
-
-function renderAudioFix(id, st) {
-  const box = $("#audiofix");
-  if (currentFileId !== id) return; // user moved on
-  box.replaceChildren();
-
-  box.appendChild(el("b", "Audio fix: "));
-  if (st.state === "ready") {
-    box.appendChild(el("span", `AAC-remuxed copy is ready (${(st.size / 1048576).toFixed(0)} MB, local). `));
-    const btn = el("button", "Play remuxed version (restores sound)");
-    btn.onclick = () => playRemuxed(id);
-    box.appendChild(btn);
-  } else if (st.state === "processing") {
-    box.appendChild(el("span", `Building AAC-remux in background… ${st.detail || ""} (video is copied, only audio re-encoded; page updates when done)`));
-    pollTimer || (pollTimer = setInterval(async () => {
-      const s = await (await fetch(`/remux/${id}/status`)).json();
-      renderAudioFix(id, s);
-      if (s.state !== "processing") { clearInterval(pollTimer); pollTimer = null; }
-    }, 3000));
-  } else if (st.state === "error") {
-    box.appendChild(el("span", `Remux failed: ${st.detail} `));
-    const btn = el("button", "Retry");
-    btn.onclick = () => startRemux(id);
-    box.appendChild(btn);
-  } else {
-    box.appendChild(el("span", "A browser-decodable audio track is missing. Build a one-time remux (video copied bit-exact, AC3/DTS audio → AAC; reads the file once from Drive and caches it): "));
-    const btn = el("button", "Build AAC remux");
-    btn.onclick = () => startRemux(id);
-    box.appendChild(btn);
-  }
-}
-
-async function startRemux(id) {
-  $("#audiofix").replaceChildren(el("span", "Starting remux…"));
-  const res = await fetch(`/remux/${id}`, { method: "POST" });
-  const st = await res.json();
-  if (!res.ok) { $("#audiofix").textContent = "Failed to start: " + (st.detail || res.statusText); return; }
-  renderAudioFix(id, st);
-}
-
-function playRemuxed(id) {
-  if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
-  video.muted = false;   // remuxed copy has native AAC
-  const resume = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-  const wasPlaying = !video.paused;
-  video.src = `/remux/${id}.mkv`;
-  video.addEventListener("loadedmetadata", () => {
-    video.currentTime = Math.min(resume, (video.duration || resume));
-    if (wasPlaying) video.play().catch(() => {});
-  }, { once: true });
-  video.load();
-}
-
-/* ---------------- seek test buttons + media event log ---------------- */
-
-document.querySelectorAll("[data-jump]").forEach(btn =>
-  btn.addEventListener("click", () => {
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-      video.currentTime = video.duration * parseFloat(btn.dataset.jump);
-    }
-  }));
-
-for (const ev of ["loadedmetadata","seeking","seeked","waiting","canplay","progress","stalled","error"]) {
-  video.addEventListener(ev, () => {
-    const bufferedEnd = video.buffered.length
-      ? video.buffered.end(video.buffered.length - 1).toFixed(1) : "0.0";
-    $("#status").textContent =
-      `event: ${ev} | now ${video.currentTime.toFixed(1)}s | buffered to ${bufferedEnd}s`;
-    if (ev === "error" && video.error) {
-      $("#status").textContent += ` (media error code ${video.error.code}: ${video.error.message || "unknown"})`;
-    }
-  });
-}
-
-main();
-</script>
+<script type="module" src="/static/app.js"></script>
 </body>
 </html>

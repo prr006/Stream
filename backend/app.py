@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+import engine
 import media
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -292,6 +293,12 @@ async def probe_file(file_id: str):
     Inspect container + streams via ffprobe/ffmpeg (reads only file headers).
     Result is cached per file id; subtitle entries get a ready-to-use VTT url.
     """
+    info = await _load_probe(file_id)
+    return info
+
+
+async def _load_probe(file_id: str) -> dict:
+    """Cached probe used by both /probe and the media-engine plan endpoint."""
     token = await require_token()
     cache = PROBE_CACHE / f"{media._safe_id(file_id)}.json"
 
@@ -311,6 +318,34 @@ async def probe_file(file_id: str):
         s["url"] = f"/subtitles/{file_id}/{s['index']}.vtt" if s["web_compatible"] else None
     info["playability"] = media.assess_playability(info)
     return info
+
+
+# --------------------------------------------------------------------------
+# Media engine: minimum-intervention playback plan (Direct Play ladder)
+# --------------------------------------------------------------------------
+
+@app.get("/media/{file_id}/plan")
+async def media_plan_default(file_id: str):
+    """Plan against the conservative server-side default capabilities
+    (handy for curl/debugging; browsers should POST their real matrix)."""
+    info = await _load_probe(file_id)
+    return engine.decide(info, None)
+
+
+@app.post("/media/{file_id}/plan")
+async def media_plan(file_id: str, request: Request):
+    """
+    The ONE entry point pages call: browser posts its measured capability
+    matrix, the engine answers with the minimum-intervention playback plan
+    (direct-play → wasm-audio → container-remux → audio-remux → transcode).
+    Pages render/adapt to the plan; they never branch on codecs themselves.
+    """
+    try:
+        caps = await request.json()
+    except Exception:
+        caps = None
+    info = await _load_probe(file_id)
+    return engine.decide(info, caps)
 
 
 @app.get("/subtitles/{file_id}/{stream_index}.vtt")
