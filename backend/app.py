@@ -22,6 +22,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 import media
 
@@ -412,3 +413,10 @@ def remux_file(file_id: str, request: Request):
 @app.get("/")
 def index():
     return FileResponse(FRONTEND_DIR / "index.html")
+
+
+# Static mount AFTER API routes: serves ac3-audio.js and vendored browser libs
+# (frontend/vendor/ is gitignored — regenerate with `python backend/fetch_vendor.py`).
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR), check_dir=False),
+          name="static")
+

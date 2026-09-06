@@ -16,19 +16,25 @@ whole file first**.
 ```
 Stream/
 ├── backend/
-│   ├── app.py            # OAuth + /files + range-aware /stream proxy + /probe + /subtitles
-│   ├── media.py          # ffprobe/ffmpeg stream detection + subtitle→WebVTT extraction
+│   ├── app.py            # OAuth + /files + /stream (range proxy) + /probe + /subtitles + /remux
+│   ├── media.py          # ffprobe/ffmpeg probing, subtitle→WebVTT, remux, local ranged serving
+│   ├── fetch_vendor.py   # downloads pinned mediabunny + ffmpeg.wasm into frontend/vendor/
 │   ├── requirements.txt  # fastapi, uvicorn, httpx, python-dotenv, imageio-ffmpeg
 │   └── .env.example      # copy to .env and fill in your OAuth client credentials
 ├── frontend/
-│   └── index.html        # file picker + <video> player + seek buttons + subtitle UI
+│   ├── index.html        # file picker + player + seek buttons + subtitles + WASM/remux panels
+│   ├── ac3-audio.js      # AC3 WASM player (demux→decode→schedule→sync engine, DOM-free class)
+│   └── vendor/           # mediabunny + ffmpeg-core wasm (gitignored; run fetch_vendor.py)
 ├── tests/
-│   ├── fake_drive.py        # fake Drive upstream that serves bytes with Range support
-│   ├── test_range_proxy.py  # end-to-end proof that Range passthrough is byte-exact
-│   └── test_subtitles.py    # MKV probe + subtitle extraction tests (real ffmpeg round-trip)
-├── cache/                # created at runtime: probe JSON + extracted .vtt (gitignored)
-├── .gitignore            # ignores .env, token.json, .venv, cache/
-└── token.json            # created automatically after you authorize (DO NOT COMMIT — already gitignored)
+│   ├── fake_drive.py        # fake Drive upstream with Range support
+│   ├── test_range_proxy.py  # byte-exact 206 range passthrough
+│   ├── test_subtitles.py    # probe + subtitle extraction (real ffmpeg round-trip)
+│   ├── test_remux.py        # HEVC copy + AC3→AAC remux pipeline
+│   ├── ac3_wasm_test.mjs    # Node driver for the WASM pipeline
+│   └── test_wasm_audio.py   # orchestrates servers + node; asserts sync/demux/decode/ranges
+├── cache/                # runtime: probe json + extracted .vtt + remuxed .mkv (gitignored)
+├── .gitignore            # .env, token.json, .venv, cache/, frontend/vendor/
+└── token.json            # created automatically after you authorize (DO NOT COMMIT)
 ```
 
 ## 1. Google Cloud configuration (one-time, ~5 minutes)
@@ -110,7 +116,9 @@ Spins up the fake Drive upstream and verifies full-body, bounded, open-ended and
 requests come back byte-exact with `206` + `Content-Range`, plus that the auth gate returns 401.
 
 ```bash
-python tests/test_subtitles.py
+python tests/test_subtitles.py       # MKV probe + subtitle extraction
+python tests/test_remux.py           # audio-only AAC remux (HEVC copied, AC3->AAC)
+python tests/test_wasm_audio.py      # browser WASM AC3 pipeline via Node (needs vendor fetch first)
 ```
 
 Unit-tests the ffprobe/ffmpeg stream parsers, then synthesizes a **real MKV with two embedded
@@ -152,6 +160,42 @@ player to see, per track: `readyState` (NONE/LOADING/LOADED/ERROR), current `mod
 of a (file, track) pair reads the **entire file sequentially server-side** from Drive (demux
 only, no decode — roughly the full file size against that account's daily Drive download quota).
 After that, the ~100 KB `.vtt` is served from disk instantly. Probe calls only read the header.
+
+### AC3/E-AC3 audio in-browser, decoded by WASM (experimental v0)
+
+Stock desktop Chromium has AC3 **demux/decode compiled out** (Dolby licensing), so AC3 tracks in
+MKV play silent. This milestone proves full browser playback *without touching the file*:
+
+```
+                 ┌────────────────────── existing: <video> muted — HEVC + WebVTT subs
+/stream/{id} ────┤
+  (range proxy)  └─ mediabunny UrlSource (lazy Range reads) ──► AC3 packets
+                       │  batches ≈ 64 packets ≈ 2 s
+                       ▼
+              ffmpeg-core.wasm (exec: ac3 → f32le stereo 48 kHz, main thread)
+                       │  PCM
+                       ▼
+              Web Audio: AudioBufferSourceNodes scheduled on the AudioContext clock,
+              anchored to video.currentTime (soft glide >45 ms, hard re-anchor >150 ms;
+              suspend on pause/stall/seek; seek → mediabunny cue-indexed restart)
+```
+
+- Everything loads from the repo: `python backend/fetch_vendor.py` pulls pinned
+  `mediabunny 1.55.7` + `@ffmpeg/core 0.12.10` into `frontend/vendor/` (gitignored, ~70 MB).
+  No npm install needed — the script is pure stdlib.
+- Bounded buffering: decoding pauses when ~30 s of audio is scheduled ahead (resumes < 18 s).
+- Network stays lazy: only the packets around the playhead (+ ~30 s horizon) are fetched;
+  verified in tests — the 40 s fixture played 2 s while touching ~57% less bytes than the full
+  file, and `getKeyPacket(t)` re-anchors near-t exactly (cue-indexed seek for MKV).
+- Sync: AudioContext clock slaved to `video.currentTime`; `pause`/`waiting`/`seeking` suspend
+  the audio clock so buffering never desyncs.
+- Decode cost measured: **~27 ms per 2 s chunk** in Node (≈75× realtime) — AC3 is cheap.
+- Live stats rendered in the "WASM AC3 audio" panel (decoded seconds, packets, buffer
+  horizon, decode ms/chunk).
+- V0 limitations: first AC3/E-AC3 track only; `playbackRate = 1`; DTS not wired (same
+  approach would work: `-f dts`); hard re-anchor causes a brief re-buffer gap; main-thread
+  decode (worker-ize if profiling ever shows jank); AC3 dialog normalization makes output
+  quieter than VLC by design of the codec (`-dialnorm` handling can be revisited).
 
 ### Audio-only AAC remux (HEVC/AC3 etc.)
 

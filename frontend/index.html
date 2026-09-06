@@ -52,6 +52,7 @@
 </p>
 
 <div id="detect" class="panel" hidden></div>
+<div id="wasm" class="panel" hidden></div>
 <div id="audiofix" class="panel" hidden></div>
 <div id="subs" class="panel" hidden></div>
 
@@ -69,6 +70,7 @@ const el = (tag, text) => { const e = document.createElement(tag); e.textContent
 
 let currentFileId = null;
 let pollTimer = null;
+let wasmCtl = null;   // Ac3WasmAudio instance while enabled
 
 /* ---------------- file list / auth ---------------- */
 
@@ -111,8 +113,10 @@ function render(files) {
 function play(id, name) {
   currentFileId = id;
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
+  video.muted = false;
   clearSubs();
-  ["#detect", "#audiofix", "#subs"].forEach(s => { $(s).hidden = true; });
+  ["#detect", "#wasm", "#audiofix", "#subs"].forEach(s => { $(s).hidden = true; });
   video.src = `/stream/${id}`;
   $("#now-playing").textContent = name;
   video.play().catch(() => {});
@@ -137,7 +141,60 @@ async function probe(id) {
   }
   renderDetection(info);
   renderSubtitles(info);
+  setupWasmAudio(id, info);
   if (info.playability.needs_audio_remux) setupAudioFix(id);
+}
+
+/* ---------------- WASM AC3 audio (V0) ---------------- */
+
+function setupWasmAudio(id, info) {
+  const box = $("#wasm");
+  const hasAc3 = (info.audio || []).some(a => /^(ac3|eac3)$/i.test(a.codec || ""));
+  if (!hasAc3) { box.hidden = true; return; }
+  box.hidden = false;
+
+  const title = el("b", "WASM AC3 audio (experimental v0): ");
+  const btn = el("button", "Enable");
+  const desc = el("span",
+    "browser-side AC3 decode (original bytes from /stream, no remux, no full download — bounded buffer). Video element stays muted.");
+  const stats = el("div", "");
+  stats.style.cssText = "color:#555;margin-top:.3rem;font-family:monospace;font-size:.8rem";
+  box.replaceChildren(title, btn, desc, stats);
+
+  btn.onclick = async () => {
+    if (wasmCtl) {            // toggle off
+      wasmCtl.dispose(); wasmCtl = null;
+      video.muted = false;
+      btn.textContent = "Enable"; stats.textContent = "disabled.";
+      return;
+    }
+    btn.disabled = true;
+    stats.textContent = "loading mediabunny + ffmpeg-core.wasm (~32MB, one-time)…";
+    try {
+      const mod = await import("/static/ac3-audio.js");
+      wasmCtl = new mod.Ac3WasmAudio(video, id, {
+        log: (m) => console.log("[ac3wasm]", m),
+        onStats: (s) => {
+          stats.textContent =
+            `decoded ${s.decodedS.toFixed(1)}s · packets ${s.packets} · ` +
+            `buffer horizon ${s.horizonS.toFixed(1)}s · decode ${s.decMsPer2SChunk} ms/2s chunk` +
+            (s.eof ? " · EOF" : "");
+        },
+      });
+      await wasmCtl.init();
+      wasmCtl.attach();
+      video.muted = true;              // native AC3 track is silent/undecodable
+      btn.disabled = false;
+      btn.textContent = "Disable";
+      stats.textContent = "active — press Play; audio syncs to the video clock.";
+      if (!video.paused) wasmCtl.resumeFrom(video.currentTime);
+    } catch (e) {
+      stats.textContent = "failed: " + (e?.message || e);
+      btn.disabled = false;
+      if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
+      video.muted = false;
+    }
+  };
 }
 
 function renderDetection(info) {
@@ -332,6 +389,8 @@ async function startRemux(id) {
 }
 
 function playRemuxed(id) {
+  if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
+  video.muted = false;   // remuxed copy has native AAC
   const resume = Number.isFinite(video.currentTime) ? video.currentTime : 0;
   const wasPlaying = !video.paused;
   video.src = `/remux/${id}.mkv`;

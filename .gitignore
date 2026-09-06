@@ -7,5 +7,8 @@ __pycache__/
 .env
 token.json
 
-# Extracted subtitle / probe caches (repo-root cache/ created at runtime)
+# Extracted subtitle / probe / remux caches (repo-root cache/ created at runtime)
 cache/
+
+# Vendored browser libs (~40-70 MB) — regenerate via backend/fetch_vendor.py
+frontend/vendor/
