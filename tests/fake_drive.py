@@ -11,6 +11,9 @@ from starlette.routing import Route
 SIZE = 5 * 1024 * 1024  # 5 MiB
 DATA = bytes((i * 7) % 256 for i in range(SIZE))
 
+# Count of alt=media (content) requests — tests assert coalescing/avoidance.
+MEDIA_FETCHES = 0
+
 
 def _parse_range(header: str, size: int) -> tuple[int, int]:
     """Parse 'bytes=start-end' / 'bytes=start-' / 'bytes=-suffix'."""
@@ -25,6 +28,7 @@ def _parse_range(header: str, size: int) -> tuple[int, int]:
 
 
 async def get_file(request):
+    global MEDIA_FETCHES
     if request.query_params.get("alt") != "media":
         return JSONResponse({
             "id": request.path_params["file_id"],
@@ -32,6 +36,7 @@ async def get_file(request):
             "size": str(SIZE),
         })
 
+    MEDIA_FETCHES += 1
     range_header = request.headers.get("range")
     if not range_header:
         return Response(DATA, media_type="video/mp4")
