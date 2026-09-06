@@ -163,6 +163,52 @@ def main() -> int:
           result.get("bytesTouched", 10**12) < len(mkv),
           f"touched={result.get('bytesTouched')} size={len(mkv)}")
 
+    # ---- phase 5: full engine class with fake WebAudio/video ---------------
+    ci = result.get("classInit", {})
+    cp = result.get("classPump", {})
+    cst = result.get("classStall", {})
+    cs = result.get("classSeek", {})
+    check("class: AudioContext running after init (user-gesture path)",
+          ci.get("ctxStateAfterInit") == "running", str(ci))
+    check("class: pump ran — packets decoded", cp.get("packets", 0) > 30, str(cp))
+    check("class: source.start() actually invoked",
+          cp.get("buffersStarted", 0) >= 1, f"started={cp.get('buffersStarted')}")
+    check("class: chunks scheduled in 2ch 48k f32",
+          cp.get("bufRate") == 48000 and cp.get("bufChannels") == 2,
+          f"rate={cp.get('bufRate')} ch={cp.get('bufChannels')}")
+    check("class: scheduled PCM is non-silent", cp.get("nonSilent") is True)
+    check("class: nothing scheduled in the past",
+          cp.get("neverScheduledPast") is True)
+    check("class: no pump errors surfaced", not cp.get("errors"), str(cp.get("errors")))
+    check("class: decoded media >= 1.5s in 2.5s wall time",
+          cp.get("decodedS", 0) >= 1.5, f"decodedS={cp.get('decodedS')}")
+    # --- regression guards for the silent-audio root cause (watchdog storm) --
+    check("class: healthy clock → exactly one resumeFrom (no watchdog storm)",
+          cp.get("resumeCallsObserved") == 1,
+          f"resumeCalls={result.get('resumeCallsTotal')}")
+    check("class: zero drift re-anchor log lines during healthy play",
+          cp.get("reAnchorLogs") == 0)
+    check("class: no fetch storm (reads stay proportionate to file size)",
+          cp.get("bytesFetched", 10**12) < len(mkv) * 1.2,
+          f"fetched={cp.get('bytesFetched')} size={len(mkv)}")
+    check("class: stall freezes audio without flapping",
+          cst.get("suspended") is True
+          and cst.get("buffersDelta", 99) <= 1
+          and cst.get("resumeCalls") == cp.get("resumeCallsObserved"),
+          str(cst))
+    check("class: after 'playing' audio resumes seamlessly (no re-anchor)",
+          cst.get("buffersResumeAfter") is True
+          and cst.get("reAnchorLogsTotal") == 0,
+          str(cst))
+    check("class: 'seeked' re-anchors exactly once at the seek target",
+          cs.get("resumeCallsDelta") == 1
+          and abs(cs.get("resumedAt", -1) - 20) < 0.01,
+          f"delta={cs.get('resumeCallsDelta')} at={cs.get('resumedAt')}")
+    check("class: seek pump decodes forward from the cue point",
+          21.5 <= cs.get("horizonAfterSeek", 0) <= 40.5,
+          f"horizon={cs.get('horizonAfterSeek')}")
+    check("class: clean dispose", result.get("classDisposed") is True)
+
     print()
     if failures:
         print(f"{failures} check(s) FAILED")

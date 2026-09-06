@@ -155,20 +155,51 @@ function setupWasmAudio(id, info) {
 
   const title = el("b", "WASM AC3 audio (experimental v0): ");
   const btn = el("button", "Enable");
+  const tone = el("button", "440 Hz test tone");
+  tone.disabled = true;
+  tone.title = "Drives the exact same output chain (gain → destination) with a pure tone. Audible tone + silent movie ⇒ fault is demux/decode, not WebAudio.";
   const desc = el("span",
     "browser-side AC3 decode (original bytes from /stream, no remux, no full download — bounded buffer). Video element stays muted.");
   const stats = el("div", "");
   stats.style.cssText = "color:#555;margin-top:.3rem;font-family:monospace;font-size:.8rem";
-  box.replaceChildren(title, btn, desc, stats);
+  const diag = el("div", "");
+  diag.style.cssText = "font-family:monospace;font-size:.72rem;color:#333;white-space:pre-wrap;margin-top:.25rem";
+  const errLine = el("div", "");
+  errLine.style.cssText = "color:#b3261e;font-size:.8rem;margin-top:.2rem";
+  box.replaceChildren(title, btn, tone, desc, stats, errLine, diag);
+
+  let diagTimer = null;
+  const fmtN = (x) => x == null ? "?" : Number(x).toFixed(2) + "s";
+  const showDiag = () => {
+    if (!wasmCtl) { diag.textContent = ""; return; }
+    const d = wasmCtl.getDiagnostics();
+    diag.textContent =
+      `ctx=${d.ctxState} ${d.sampleRate}Hz | pcm=${d.pcmFormat} | ` +
+      `video.t=${fmtN(d.videoT)} audio≈${fmtN(d.audioEstT)} ` +
+      `drift=${d.driftMs == null ? "?" : d.driftMs.toFixed(0) + "ms"}(streak ${d.driftStreak}) ` +
+      `vrs=${d.readyState} | ` +
+      `buffers: started=${d.buffersStarted} pending=${d.scheduledPending} ` +
+      `nextStartLead=${d.nextStartLeadS == null ? "?" : d.nextStartLeadS.toFixed(2) + "s"} | ` +
+      `horizon=${d.horizonS == null ? "?" : d.horizonS.toFixed(1) + "s"} | ` +
+      `rms=${d.rms.toFixed(3)} peak=${d.peak.toFixed(3)} decoded=${d.decodedS.toFixed(1)}s | ` +
+      `pkts=${d.packets} fetched=${(d.bytesFetched / 1048576).toFixed(2)}MB | ` +
+      `video.muted=${d.videoMuted} gain=${d.gainValue}${d.eof ? " | EOF" : ""}`;
+  };
+
+  tone.onclick = () => wasmCtl?.testTone(1.5);
 
   btn.onclick = async () => {
     if (wasmCtl) {            // toggle off
       wasmCtl.dispose(); wasmCtl = null;
+      clearInterval(diagTimer); diagTimer = null;
       video.muted = false;
-      btn.textContent = "Enable"; stats.textContent = "disabled.";
+      tone.disabled = true;
+      btn.textContent = "Enable";
+      stats.textContent = "disabled."; diag.textContent = ""; errLine.textContent = "";
       return;
     }
     btn.disabled = true;
+    errLine.textContent = "";
     stats.textContent = "loading mediabunny + ffmpeg-core.wasm (~32MB, one-time)…";
     try {
       const mod = await import("/static/ac3-audio.js");
@@ -177,8 +208,12 @@ function setupWasmAudio(id, info) {
         onStats: (s) => {
           stats.textContent =
             `decoded ${s.decodedS.toFixed(1)}s · packets ${s.packets} · ` +
-            `buffer horizon ${s.horizonS.toFixed(1)}s · decode ${s.decMsPer2SChunk} ms/2s chunk` +
-            (s.eof ? " · EOF" : "");
+            `horizon ${s.horizonS.toFixed(1)}s · decode ${s.decMs} ms/chunk · ` +
+            `rms ${s.rms.toFixed(3)} peak ${s.peak.toFixed(3)}` + (s.eof ? " · EOF" : "");
+        },
+        onError: (m) => {
+          errLine.textContent = "pipeline error: " + m;
+          console.error("[ac3wasm]", m);
         },
       });
       await wasmCtl.init();
@@ -186,10 +221,13 @@ function setupWasmAudio(id, info) {
       video.muted = true;              // native AC3 track is silent/undecodable
       btn.disabled = false;
       btn.textContent = "Disable";
-      stats.textContent = "active — press Play; audio syncs to the video clock.";
+      tone.disabled = false;
+      wasmCtl.testTone(0.8);           // 440 Hz blip proves the output chain immediately
+      stats.textContent = "active — press Play. If the tone was silent, the problem is WebAudio output, not AC3.";
+      diagTimer = setInterval(showDiag, 500);
       if (!video.paused) wasmCtl.resumeFrom(video.currentTime);
     } catch (e) {
-      stats.textContent = "failed: " + (e?.message || e);
+      errLine.textContent = "init failed: " + (e?.message || e);
       btn.disabled = false;
       if (wasmCtl) { wasmCtl.dispose(); wasmCtl = null; }
       video.muted = false;

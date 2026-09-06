@@ -118,7 +118,7 @@ requests come back byte-exact with `206` + `Content-Range`, plus that the auth g
 ```bash
 python tests/test_subtitles.py       # MKV probe + subtitle extraction
 python tests/test_remux.py           # audio-only AAC remux (HEVC copied, AC3->AAC)
-python tests/test_wasm_audio.py      # browser WASM AC3 pipeline via Node (needs vendor fetch first)
+python tests/test_wasm_audio.py      # browser WASM AC3 pipeline via Node, class-level engine tests incl. storm guards (needs vendor fetch first)
 ```
 
 Unit-tests the ffprobe/ffmpeg stream parsers, then synthesizes a **real MKV with two embedded
@@ -161,7 +161,7 @@ of a (file, track) pair reads the **entire file sequentially server-side** from 
 only, no decode — roughly the full file size against that account's daily Drive download quota).
 After that, the ~100 KB `.vtt` is served from disk instantly. Probe calls only read the header.
 
-### AC3/E-AC3 audio in-browser, decoded by WASM (experimental v0)
+### AC3/E-AC3 audio in-browser, decoded by WASM (experimental v1)
 
 Stock desktop Chromium has AC3 **demux/decode compiled out** (Dolby licensing), so AC3 tracks in
 MKV play silent. This milestone proves full browser playback *without touching the file*:
@@ -176,8 +176,9 @@ MKV play silent. This milestone proves full browser playback *without touching t
                        │  PCM
                        ▼
               Web Audio: AudioBufferSourceNodes scheduled on the AudioContext clock,
-              anchored to video.currentTime (soft glide >45 ms, hard re-anchor >150 ms;
-              suspend on pause/stall/seek; seek → mediabunny cue-indexed restart)
+              anchored to video.currentTime (soft glide >45 ms; hard re-anchor only after
+              ~750 ms of *sustained* drift while the video is measurably playing —
+              never on stalls/seeks; suspend on pause/stall/seek; seek → cue-indexed restart)
 ```
 
 - Everything loads from the repo: `python backend/fetch_vendor.py` pulls pinned
@@ -190,8 +191,19 @@ MKV play silent. This milestone proves full browser playback *without touching t
 - Sync: AudioContext clock slaved to `video.currentTime`; `pause`/`waiting`/`seeking` suspend
   the audio clock so buffering never desyncs.
 - Decode cost measured: **~27 ms per 2 s chunk** in Node (≈75× realtime) — AC3 is cheap.
-- Live stats rendered in the "WASM AC3 audio" panel (decoded seconds, packets, buffer
-  horizon, decode ms/chunk).
+- Live stats in the "WASM AC3 audio" panel: decode totals, packet/read counters, buffer
+  **horizon**, per-chunk PCM **rms/peak** (silence detector), decode ms, plus a second
+  diagnostics line — ctx state/rate, drift in ms (with streak), video readyState, buffers
+  started/pending, next-start lead, bytes fetched. A **440 Hz test tone** button drives the
+  same gain→destination chain: audible tone + silent movie ⇒ fault is demux/decode, not
+  WebAudio; silent tone ⇒ WebAudio output problem (autoplay policy, device mute).
+- v1 hardening (root-caused the earlier silent-audio report): (a) pump crashed before the
+  first decode via a missing helper — now every pump error surfaces into the panel and the
+  class is exercised end-to-end in Node with fake WebAudio/video; (b) the drift watchdog
+  could re-anchor every ~250 ms whenever the video clock froze (network stall, seek) and
+  at startup (the prime lead leaked into the anchor) — cancelling and restarting the decode
+  loop continuously. Now stall-aware (readyState/seeking/waiting guards + streak counter)
+  and the anchor math is lead-corrected; tests pin "exactly one resumeFrom per user action".
 - V0 limitations: first AC3/E-AC3 track only; `playbackRate = 1`; DTS not wired (same
   approach would work: `-f dts`); hard re-anchor causes a brief re-buffer gap; main-thread
   decode (worker-ize if profiling ever shows jank); AC3 dialog normalization makes output
