@@ -264,6 +264,9 @@ def integration_tests():
     r = client.get(f"/subtitles/vid123/{eng_idx}.vtt")
     check("eng vtt returns 200", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
     check("eng vtt content-type", r.headers.get("content-type", "").startswith("text/vtt"))
+    check("vtt NOT served as attachment (Chrome <track> would discard it)",
+          "attachment" not in r.headers.get("content-disposition", "").lower(),
+          r.headers.get("content-disposition", ""))
     check("eng vtt has WEBVTT header", r.text.strip().startswith("WEBVTT"))
     check("eng vtt contains first cue text", "Hello POC world" in r.text)
     check("eng vtt contains second cue", "Second english cue" in r.text)

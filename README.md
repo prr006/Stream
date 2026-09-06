@@ -140,10 +140,37 @@ any code path    --------------------->  /probe/{fileId}    ffprobe/ffmpeg reads
 - **Image-based subtitles (PGS/VobSub) are detected and shown as unsupported** — converting them
   to text requires OCR (possible future add-on, e.g. SubtitleEdit / pgsrip).
 
+**Subtitle rendering details that matter:** the `.vtt` endpoint serves `Content-Type: text/vtt`
+and must NOT send `Content-Disposition: attachment` (Chrome otherwise downloads the payload
+instead of parsing it as cues). The page controls rendering via the standard TextTracks API
+(`track.mode = "showing" | "disabled"`). Open the **"Text-track diagnostics"** panel under the
+player to see, per track: `readyState` (NONE/LOADING/LOADED/ERROR), current `mode`, parsed
+`cues` count, first cue timestamp, and a **"jump to first cue"** button. Rule of thumb:
+`LOADED + cues>0 + mode=showing` ⇒ cues should be visible at the right timestamp.
+
 **The one real cost:** MKV interleaves subtitle packets with A/V data, so the *first* extraction
 of a (file, track) pair reads the **entire file sequentially server-side** from Drive (demux
 only, no decode — roughly the full file size against that account's daily Drive download quota).
 After that, the ~100 KB `.vtt` is served from disk instantly. Probe calls only read the header.
+
+### Audio-only AAC remux (HEVC/AC3 etc.)
+
+When `/probe` reports an audio codec browsers can't decode (AC3, E-AC3, DTS, TrueHD, raw PCM —
+`playability.needs_audio_remux: true`), the UI offers a one-click fix:
+
+```
+ffmpeg -i <drive-url> -map 0:v:0 -c:v copy -map 0:a -c:a aac -b:a 192k \
+       -map 0:s? -c:s copy -f matroska cache/remux/<id>.mkv
+```
+
+- **Video bitstream is copied bit-exact (`-c:v copy`)** — HEVC is preserved as-is, zero video
+  re-encode. Only audio is converted (negligible CPU). Subtitle streams are carried over.
+- Endpoints: `POST /remux/{file_id}` (start background job), `GET /remux/{file_id}/status`
+  (progress in MB written), `GET /remux/{file_id}.mkv` (**Range-capable** local file serving).
+- The remux reads the file once from Drive, then playback is pure local disk:
+  **seeking becomes instant and Drive-free**. The player keeps your position when swapping
+  to the remuxed copy.
+- Rejected alternative: live transmux stream (zero storage, but unknown duration ⇒ no seeking).
 
 ### How to test with one of YOUR MKV files
 
@@ -169,10 +196,11 @@ After that, the ~100 KB `.vtt` is served from disk instantly. Probe calls only r
 ## Known limitations (POC scope)
 
 - **MKV playback = Chrome/Edge only.** Safest codecs: H.264/VP9/AV1 video + AAC/Opus/MP3 audio.
-  The `/probe` endpoint warns per-file: HEVC/MPEG-2 video cannot decode in browsers;
-  AC3/DTS/TrueHD audio plays silent; PGS/VobSub subtitles are image-based (need OCR).
-  Fixing any of these requires remux/transcode — deliberately out of scope (no seek-safe way
-  to do cheap on-the-fly remux without a full HLS/MSE segment pipeline).
+  The `/probe` endpoint warns per-file: HEVC video only decodes where the OS/GPU provides an
+  HEVC decoder (often OK on Windows); AC3/DTS/TrueHD audio plays silent **unless you build the
+  AAC remux** (see "Audio-only AAC remux"); PGS/VobSub subtitles are image-based (need OCR).
+  **Full video transcoding is still out of scope** — if HEVC itself won't decode on your
+  machine, that needs a real transcode or HLS pipeline milestone.
 - **`HEAD` requests are not implemented.** Native `<video>` elements don't need them (they use
   range `GET`s), but some external players would.
 - **Drive is not a video CDN.** Seek latency is typically a few hundred ms (a fresh range request

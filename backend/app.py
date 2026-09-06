@@ -48,7 +48,8 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 CACHE_DIR = Path(os.getenv("CACHE_DIR", str(BASE_DIR / "cache")))
 PROBE_CACHE = CACHE_DIR / "probe"
 SUBS_CACHE = CACHE_DIR / "subs"
-for _d in (PROBE_CACHE, SUBS_CACHE):
+REMUX_DIR = CACHE_DIR / "remux"
+for _d in (PROBE_CACHE, SUBS_CACHE, REMUX_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # Subtitle extraction reads the whole file server-side on first request.
@@ -58,12 +59,21 @@ app = FastAPI(title="Stream POC")
 
 _locks: dict[str, asyncio.Lock] = {}
 
+# Background audio-remux job state (single-process POC; rebuilt on restart
+# from the presence of cached files).
+REMUX_JOBS: dict[str, dict] = {}
+
 
 def _lock(key: str) -> asyncio.Lock:
     """Per-resource async lock so we never run duplicate ffmpeg extractions."""
     if key not in _locks:
         _locks[key] = asyncio.Lock()
     return _locks[key]
+
+
+def _remux_paths(file_id: str) -> tuple[Path, Path]:
+    safe = media._safe_id(file_id)
+    return REMUX_DIR / f"{safe}.part", REMUX_DIR / f"{safe}.mkv"
 
 
 # --------------------------------------------------------------------------
@@ -321,8 +331,78 @@ async def get_subtitles(file_id: str, stream_index: int):
             raise HTTPException(503, str(e))
         except media.ExtractError as e:
             raise HTTPException(422, str(e))
-    return FileResponse(path, media_type="text/vtt",
-                        filename=f"track{stream_index}.vtt")
+    # IMPORTANT: no Content-Disposition: attachment here — Chrome treats an
+    # attachment-<track> response as a download instead of WebVTT cues, which
+    # makes fetched-but-invisible subtitles. Default (inline) is required.
+    return FileResponse(path, media_type="text/vtt")
+
+
+# --------------------------------------------------------------------------
+# Audio-only AAC remux (HEVC/other video bitstream copied, audio remixed)
+# --------------------------------------------------------------------------
+
+@app.post("/remux/{file_id}")
+async def remux_start(file_id: str):
+    """Kick off a background audio->AAC remux (idempotent; cached)."""
+    token = await require_token()
+    part, final = _remux_paths(file_id)
+
+    if final.exists():
+        REMUX_JOBS[file_id] = {"state": "ready", "detail": "already cached"}
+        return {"state": "ready", "url": f"/remux/{file_id}.mkv"}
+
+    async with _lock(f"remux:{file_id}"):
+        job = REMUX_JOBS.get(file_id)
+        if job and job.get("state") == "processing":
+            return {"state": "processing", "detail": job.get("detail", "")}
+        if final.exists():  # completed while we waited on the lock
+            REMUX_JOBS[file_id] = {"state": "ready", "detail": ""}
+            return {"state": "ready", "url": f"/remux/{file_id}.mkv"}
+
+        REMUX_JOBS[file_id] = {"state": "processing", "detail": "starting"}
+
+        async def runner():
+            try:
+                await media.remux_audio_aac(
+                    file_id, token, DRIVE_API_BASE, part, final,
+                    timeout=EXTRACT_TIMEOUT_S)
+                REMUX_JOBS[file_id] = {"state": "ready", "detail": "complete"}
+            except Exception as e:  # noqa: BLE001 - surfaced via status endpoint
+                part.unlink(missing_ok=True)
+                REMUX_JOBS[file_id] = {"state": "error", "detail": str(e)[:500]}
+
+        asyncio.create_task(runner())
+    return {"state": "processing"}
+
+
+@app.get("/remux/{file_id}/status")
+def remux_status(file_id: str):
+    """Poll remux progress: none | processing (bytes written) | ready | error."""
+    part, final = _remux_paths(file_id)
+    if final.exists():
+        return {"state": "ready", "detail": "",
+                "url": f"/remux/{file_id}.mkv",
+                "size": final.stat().st_size}
+    job = REMUX_JOBS.get(file_id)
+    if job and job.get("state") == "processing":
+        written = part.stat().st_size if part.exists() else 0
+        return {"state": "processing",
+                "detail": f"{written / 1048576:.1f} MB written so far"}
+    if job:
+        return job
+    return {"state": "none", "detail": "not started"}
+
+
+@app.get("/remux/{file_id}.mkv")
+def remux_file(file_id: str, request: Request):
+    """Serve the cached remux with Range support (local disk = instant seeks)."""
+    _part, final = _remux_paths(file_id)
+    if not final.exists():
+        raise HTTPException(
+            404, "Remux not built. POST /remux/{file_id} first, "
+                 "then poll /remux/{file_id}/status.")
+    return media.ranged_file_response(
+        final, request.headers.get("range"), "video/x-matroska")
 
 
 # --------------------------------------------------------------------------

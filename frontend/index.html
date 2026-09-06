@@ -18,13 +18,16 @@
   #banner.ok { background: #e6f4ea; }
   #status { font-size: .85rem; color: #555; }
   #now-playing { font-weight: 600; }
-  input { padding: .35rem .5rem; margin-bottom: .5rem; }
-  #detect { font-size: .9rem; border: 1px solid #ddd; border-radius: 6px; padding: .6rem .8rem; margin-top: .5rem; }
-  #detect .warn { color: #b3261e; }
-  #detect code { background: #f1f3f4; padding: 0 .3rem; border-radius: 3px; }
-  #subs { margin-top: .5rem; }
-  #subs label { display: block; padding: .2rem 0; }
+  input[type=text] { padding: .35rem .5rem; margin-bottom: .5rem; }
+  .panel { font-size: .9rem; border: 1px solid #ddd; border-radius: 6px; padding: .6rem .8rem; margin-top: .5rem; }
+  .panel .warn { color: #b3261e; }
+  .panel code { background: #f1f3f4; padding: 0 .3rem; border-radius: 3px; }
+  panel label, #subs label { display: block; padding: .2rem 0; }
   #subs .unsupported { color: #888; }
+  #subs button { font-size: .75rem; padding: .1rem .4rem; margin-left: .4rem; }
+  #diag { font-size: .75rem; background: #111; color: #0f0; padding: .5rem .7rem;
+          border-radius: 6px; white-space: pre-wrap; margin-top: .5rem; max-height: 220px; overflow-y: auto; }
+  details { margin-top: 1rem; }
 </style>
 </head>
 <body>
@@ -34,12 +37,12 @@
 <div id="banner">checking authorization&hellip;</div>
 
 <h2>1. Pick a video from your Drive</h2>
-<input id="filter" placeholder="filter by name&hellip;" size="32">
+<input id="filter" type="text" placeholder="filter by name&hellip;" size="32">
 <ul id="files"></ul>
 
 <h2>2. Play / seek</h2>
 <p id="now-playing"></p>
-<video id="player" controls preload="metadata" crossorigin="anonymous"></video>
+<video id="player" controls preload="metadata"></video>
 <p>
   Seek to:
   <button data-jump="0.25">25%</button>
@@ -48,20 +51,32 @@
   <span id="status"></span>
 </p>
 
-<div id="detect" hidden></div>
-<div id="subs"></div>
+<div id="detect" class="panel" hidden></div>
+<div id="audiofix" class="panel" hidden></div>
+<div id="subs" class="panel" hidden></div>
+
+<details>
+  <summary>Text-track diagnostics (why is/isn't a subtitle rendering?)</summary>
+  <div id="diag">no track data yet</div>
+</details>
 
 <script>
 const $ = (s) => document.querySelector(s);
 const video = $("#player");
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+const el = (tag, text) => { const e = document.createElement(tag); e.textContent = text; return e; };
+
+let currentFileId = null;
+let pollTimer = null;
+
+/* ---------------- file list / auth ---------------- */
 
 async function main() {
   const status = await (await fetch("/auth/status")).json();
   if (!status.authorized) {
     $("#banner").innerHTML =
-      'Not authorized. <a href="/auth/login">Sign in with Google</a> to list and stream your videos.';
+      'Not authorized. <a href="/auth/login">Sign in with Google</a>.';
     return;
   }
   $("#banner").className = "ok";
@@ -69,8 +84,7 @@ async function main() {
 
   const res = await fetch("/files");
   if (res.status === 401) {
-    $("#banner").innerHTML =
-      'Session expired. <a href="/auth/login">Re-authorize with Google</a>.';
+    $("#banner").innerHTML = 'Session expired. <a href="/auth/login">Re-authorize</a>.';
     return;
   }
   const data = await res.json();
@@ -90,22 +104,19 @@ function render(files) {
                 <small>${escapeHtml(f.mimeType)} &middot; ${size}</small></li>`;
       }).join("")
     : "<li><small>No video files found in this Drive account.</small></li>";
-
   document.querySelectorAll("#files a").forEach(a =>
-    a.addEventListener("click", (e) => {
-      e.preventDefault();
-      play(a.dataset.id, a.textContent);
-    }));
+    a.addEventListener("click", (e) => { e.preventDefault(); play(a.dataset.id, a.textContent); }));
 }
 
 function play(id, name) {
+  currentFileId = id;
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   clearSubs();
-  $("#detect").hidden = true;
-  $("#subs").innerHTML = "";
+  ["#detect", "#audiofix", "#subs"].forEach(s => { $(s).hidden = true; });
   video.src = `/stream/${id}`;
   $("#now-playing").textContent = name;
-  video.play().catch(() => {}); // autoplay may be blocked; user can press play
-  probe(id);                    // async: show container/codec/subtitle info
+  video.play().catch(() => {});
+  probe(id);
 }
 
 /* ---------------- probing / detection ---------------- */
@@ -113,103 +124,225 @@ function play(id, name) {
 async function probe(id) {
   const box = $("#detect");
   box.hidden = false;
-  box.innerHTML = "Probing container/codec/subtitle streams via <code>/probe</code>&hellip;";
+  box.textContent = "Probing container/codec/subtitle streams via /probe ...";
   let info;
   try {
     const res = await fetch(`/probe/${id}`);
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     info = await res.json();
   } catch (e) {
-    box.innerHTML = `<span class="warn">Probe failed: ${escapeHtml(e.message)}</span>`;
+    box.innerHTML = `<span class="warn"></span>`;
+    box.querySelector(".warn").textContent = `Probe failed: ${e.message}`;
     return;
   }
   renderDetection(info);
   renderSubtitles(info);
+  if (info.playability.needs_audio_remux) setupAudioFix(id);
 }
 
 function renderDetection(info) {
   const p = info.playability;
-  const lines = [];
+  const rows = [];
+  const push = (html) => { const d = document.createElement("div"); d.innerHTML = html; rows.push(d); };
+  const pushWarn = (text) => { const d = el("div", "⚠ " + text); d.className = "warn"; rows.push(d); };
+
   const dur = info.duration ? (info.duration / 60).toFixed(0) + " min" : "?";
-  lines.push(`<b>Container:</b> <code>${escapeHtml(p.container || "?")}</code> &middot; duration ${dur} (via ${info.probe_engine})`);
-  if (info.video) lines.push(`<b>Video:</b> <code>${escapeHtml(info.video.codec)}</code> ${info.video.width || "?"}x${info.video.height || "?"}`);
-  lines.push(`<b>Audio:</b> ${info.audio.map(a => `<code>${escapeHtml(a.codec)}</code> (${escapeHtml(a.language)})`).join(", ") || "none"}`);
-  lines.push(escapeHtml(p.browser_note));
+  push(`<b>Container:</b> <code>${escapeHtml(p.container || "?")}</code> · duration ${dur} (via ${escapeHtml(info.probe_engine)})`);
+  if (info.video) push(`<b>Video:</b> <code>${escapeHtml(info.video.codec)}</code> ${info.video.width || "?"}x${info.video.height || "?"}`);
+  push(`<b>Audio:</b> ${info.audio.map(a => `<code>${escapeHtml(a.codec)}</code> (${escapeHtml(a.language)})`).join(", ") || "none"}`);
+  pushWarnFree(rows, p.browser_note);
+  if (info.format_name.includes("matroska")) {
+    const cpt = video.canPlayType('video/x-matroska');
+    if (cpt === "") pushWarn("This browser reports no MKV support in <video>. Use Chrome/Edge.");
+    else push(`This browser's MKV check: <code>${escapeHtml(cpt)}</code>`);
+  }
+  (p.warnings || []).forEach(pushWarn);
 
-  // What does THIS browser think about MKV?
-  const mkvSupport = info.format_name.includes("matroska")
-    ? video.canPlayType('video/x-matroska')
-    : "n/a";
-  if (mkvSupport === "") lines.push(`<span class="warn">This browser reports no MKV support in &lt;video&gt;. Use Chrome/Edge.</span>`);
-  else if (mkvSupport !== "n/a") lines.push(`This browser's MKV check: <code>${mkvSupport || "no"}</code>`);
-
-  (p.warnings || []).forEach(w => lines.push(`<span class="warn">&#9888; ${escapeHtml(w)}</span>`));
-  $("#detect").innerHTML = lines.map(l => `<div>${l}</div>`).join("");
+  const box = $("#detect");
+  box.replaceChildren(...rows);
+}
+function pushWarnFree(rows, text) {
+  const d = el("div", text); rows.push(d);
 }
 
 /* ---------------- subtitles ---------------- */
 
-let subtitleEntries = []; // {trackEl, label}
-
 function clearSubs() {
   video.querySelectorAll("track").forEach(t => t.remove());
-  subtitleEntries = [];
 }
 
 function renderSubtitles(info) {
   const box = $("#subs");
+  box.hidden = false;
   const subs = info.subtitles || [];
+  const frag = document.createDocumentFragment();
+  frag.appendChild(el("h2", "3. Subtitles (embedded tracks → WebVTT)"));
   if (!subs.length) {
-    box.innerHTML = "<h2>3. Subtitles</h2><em>No embedded subtitle tracks detected.</em>";
+    frag.appendChild(el("em", "No embedded subtitle tracks detected."));
+    box.replaceChildren(frag);
     return;
   }
-  box.innerHTML = "<h2>3. Subtitles (embedded tracks &rarr; WebVTT)</h2>";
-  let firstCompatible = true;
 
+  let firstCompatible = true;
   subs.forEach((t) => {
     const label = t.title || t.language || `stream ${t.index}`;
+
     if (!t.web_compatible) {
-      box.innerHTML += `<div class="unsupported">&#10007; ${escapeHtml(label)}
-        <small>(${escapeHtml(t.codec)} — ${escapeHtml(t.note || "unsupported")})</small></div>`;
+      const d = el("div", `✗ ${label} (${t.codec} — ${t.note || "unsupported"})`);
+      d.className = "unsupported";
+      frag.appendChild(d);
       return;
     }
 
-    // <track> element: browser fetches our /subtitles/...vtt and renders cues
+    // <track> element: the browser fetches our /subtitles/*.vtt and renders cues.
     const trackEl = document.createElement("track");
     trackEl.kind = "subtitles";
-    trackEl.src = t.url;
-    trackEl.srclang = t.language || "und";
+    trackEl.src = t.url;                       // e.g. /subtitles/<id>/3.vtt
+    trackEl.srclang = (t.language && t.language !== "und") ? t.language : "en";
     trackEl.label = label;
-    video.appendChild(trackEl);
-    const entry = { trackEl, label };
-    subtitleEntries.push(entry);
+    if (firstCompatible) { trackEl.default = true; }
+    video.appendChild(trackEl);                // MUST be in the DOM to load
 
     const row = document.createElement("label");
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    if (firstCompatible) { cb.checked = true; firstCompatible = false; }
-    row.appendChild(cb);
-    row.appendChild(document.createTextNode(` ${label} (${t.codec}${t.language ? ", " + t.language : ""})`));
-    const note = document.createElement("small");
+    cb.checked = firstCompatible;
+    firstCompatible = false;
+    const note = el("small", "");
     note.style.color = "#777";
-    note.textContent = " (loads from server cache)";
+    const jumpBtn = el("button", "jump to first cue");
+    jumpBtn.style.display = "none";
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(` ${label} (${t.codec}, ${trackEl.srclang})`));
     row.appendChild(note);
-    box.appendChild(row);
+    row.appendChild(jumpBtn);
+    frag.appendChild(row);
 
     const apply = () => {
-      entry.trackEl.track.mode = cb.checked ? "showing" : "disabled";
-      note.textContent = cb.checked ? "" : " (off)";
+      // THE critical line: mode must be "showing" to render, "disabled" when off.
+      trackEl.track.mode = cb.checked ? "showing" : "disabled";
+      updateDiag();
     };
     cb.addEventListener("change", apply);
-    trackEl.addEventListener("load", () => { note.textContent = cb.checked ? "" : " (off)"; });
-    trackEl.addEventListener("error", () => {
-      note.textContent = " (failed to load — extraction error; check backend log)";
-      note.style.color = "#b3261e";
+
+    trackEl.addEventListener("load", () => {
+      note.textContent = cb.checked ? "" : " (loaded, off)";
+      note.style.color = "#777";
+      const cues = trackEl.track.cues;
+      if (cues && cues.length) {
+        jumpBtn.style.display = "";
+        jumpBtn.onclick = () => {
+          video.currentTime = cues[0].startTime + 0.05;
+          if (!cb.checked) { cb.checked = true; apply(); }
+          video.play().catch(() => {});
+        };
+      }
+      apply();   // re-assert mode after load (some builds reset it)
+      updateDiag();
     });
-    note.textContent = cb.checked ? " (extracting… first run reads the whole file server-side)" : " (off)";
+    trackEl.addEventListener("error", () => {
+      note.textContent = " (track ERROR — see diagnostics below; likely bad headers/parse)";
+      note.style.color = "#b3261e";
+      updateDiag();
+    });
+
+    note.textContent = cb.checked
+      ? " (extracting/first load can take a while…)" : " (off)";
     apply();
   });
+
+  box.replaceChildren(frag);
+  setTimeout(updateDiag, 1500);
 }
+
+/* ---------------- diagnostics ---------------- */
+
+const READY = ["NONE", "LOADING", "LOADED", "ERROR"];
+
+function updateDiag() {
+  const lines = [];
+  lines.push(`video.src               : ${video.currentSrc || "(none)"}`);
+  lines.push(`media time/duration     : ${fmtT(video.currentTime)} / ${fmtT(video.duration)}`);
+  lines.push(`video.textTracks.length : ${video.textTracks.length}`);
+  const trackEls = [...video.querySelectorAll("track")];
+  video.textTracks.length && trackEls.forEach((elm, i) => {
+    const tr = elm.track;
+    const cues = tr.cues ? tr.cues.length : 0;
+    const first = cues ? fmtT(tr.cues[0].startTime) : "-";
+    lines.push(
+      `[${i}] ${elm.label || elm.srclang}: readyState=${elm.readyState} (${READY[elm.readyState]}), ` +
+      `mode=${tr.mode}, cues=${cues}, first-cue@${first}, src=${elm.src}`);
+  });
+  if (!trackEls.length) lines.push("(no <track> elements attached)");
+  lines.push("");
+  lines.push("How to read: readyState LOADED + cues>0 + mode=showing => cues SHOULD render.");
+  lines.push("readyState ERROR => fetch ok or not, but parsing/header/CORS failed (check Network).");
+  $("#diag").textContent = lines.join("\n");
+}
+const fmtT = (s) => Number.isFinite(s) ? s.toFixed(1) + "s" : "?";
+["loadedmetadata", "seeked", "play"].forEach(ev => video.addEventListener(ev, updateDiag));
+
+/* ---------------- audio-only AAC remux ---------------- */
+
+async function setupAudioFix(id) {
+  const box = $("#audiofix");
+  box.hidden = false;
+  const res = await fetch(`/remux/${id}/status`);
+  const st = await res.json();
+  renderAudioFix(id, st);
+}
+
+function renderAudioFix(id, st) {
+  const box = $("#audiofix");
+  if (currentFileId !== id) return; // user moved on
+  box.replaceChildren();
+
+  box.appendChild(el("b", "Audio fix: "));
+  if (st.state === "ready") {
+    box.appendChild(el("span", `AAC-remuxed copy is ready (${(st.size / 1048576).toFixed(0)} MB, local). `));
+    const btn = el("button", "Play remuxed version (restores sound)");
+    btn.onclick = () => playRemuxed(id);
+    box.appendChild(btn);
+  } else if (st.state === "processing") {
+    box.appendChild(el("span", `Building AAC-remux in background… ${st.detail || ""} (video is copied, only audio re-encoded; page updates when done)`));
+    pollTimer || (pollTimer = setInterval(async () => {
+      const s = await (await fetch(`/remux/${id}/status`)).json();
+      renderAudioFix(id, s);
+      if (s.state !== "processing") { clearInterval(pollTimer); pollTimer = null; }
+    }, 3000));
+  } else if (st.state === "error") {
+    box.appendChild(el("span", `Remux failed: ${st.detail} `));
+    const btn = el("button", "Retry");
+    btn.onclick = () => startRemux(id);
+    box.appendChild(btn);
+  } else {
+    box.appendChild(el("span", "A browser-decodable audio track is missing. Build a one-time remux (video copied bit-exact, AC3/DTS audio → AAC; reads the file once from Drive and caches it): "));
+    const btn = el("button", "Build AAC remux");
+    btn.onclick = () => startRemux(id);
+    box.appendChild(btn);
+  }
+}
+
+async function startRemux(id) {
+  $("#audiofix").replaceChildren(el("span", "Starting remux…"));
+  const res = await fetch(`/remux/${id}`, { method: "POST" });
+  const st = await res.json();
+  if (!res.ok) { $("#audiofix").textContent = "Failed to start: " + (st.detail || res.statusText); return; }
+  renderAudioFix(id, st);
+}
+
+function playRemuxed(id) {
+  const resume = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+  const wasPlaying = !video.paused;
+  video.src = `/remux/${id}.mkv`;
+  video.addEventListener("loadedmetadata", () => {
+    video.currentTime = Math.min(resume, (video.duration || resume));
+    if (wasPlaying) video.play().catch(() => {});
+  }, { once: true });
+  video.load();
+}
+
+/* ---------------- seek test buttons + media event log ---------------- */
 
 document.querySelectorAll("[data-jump]").forEach(btn =>
   btn.addEventListener("click", () => {
@@ -218,8 +351,6 @@ document.querySelectorAll("[data-jump]").forEach(btn =>
     }
   }));
 
-// Event log proves buffering/seeking: "seeking" followed by new reads and the
-// buffered range advancing.
 for (const ev of ["loadedmetadata","seeking","seeked","waiting","canplay","progress","stalled","error"]) {
   video.addEventListener(ev, () => {
     const bufferedEnd = video.buffered.length

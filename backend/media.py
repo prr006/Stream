@@ -21,6 +21,8 @@ import re
 import shutil
 from pathlib import Path
 
+from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+
 # ---------------------------------------------------------------------------
 # Binary resolution (lazy so tests can run with only the bundled binary)
 # ---------------------------------------------------------------------------
@@ -294,6 +296,9 @@ def assess_playability(info: dict) -> dict:
         "container": fmt,
         "browser_note": browser_note,
         "video_blocked": any("Video codec" in w for w in warnings),
+        # True when some audio track can't be decoded by browsers -> offer the
+        # audio-only AAC remux endpoint as the cheap fix (video stays untouched).
+        "needs_audio_remux": any(("silent" in w) or ("PCM" in w) for w in warnings),
         "warnings": warnings,
     }
 
@@ -346,3 +351,99 @@ async def extract_subtitle(
     tmp.write_text(out, encoding="utf-8")
     os.replace(tmp, dest)  # atomic publish
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Audio-only remux: copy video bitstream, convert audio to AAC
+# ---------------------------------------------------------------------------
+
+async def remux_audio_aac(
+    file_id: str,
+    token: str,
+    drive_api_base: str,
+    part_path: Path,
+    final_path: Path,
+    timeout: float = 1800,
+) -> None:
+    """
+    Remux a Drive-hosted file into MKV with the video bitstream COPIED
+    (-c:v copy: no re-encode of HEVC/etc.) and every audio track converted to
+    AAC so browsers can play sound. Subtitle streams are copied too.
+
+    Cost: one full sequential read of the file from Drive (demux + audio encode
+    only — audio encode is negligible CPU). Output cached at final_path.
+    Raises ExtractError on failure.
+    """
+    ff = ffmpeg_bin()
+    if not ff:
+        raise FFmpegMissingError(
+            "ffmpeg not found. Install ffmpeg or `pip install imageio-ffmpeg`.")
+
+    cmd = [
+        ff, "-hide_banner", "-nostdin", "-v", "error",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+        "-headers", auth_header(token),
+        "-i", media_url(drive_api_base, file_id),
+        "-map", "0:v:0", "-c:v", "copy",        # video bitstream untouched
+        "-map", "0:a", "-c:a", "aac", "-b:a", "192k",  # ALL audio -> AAC
+        "-map", "0:s?", "-c:s", "copy",         # keep embedded subtitle streams
+        "-f", "matroska", "-y", str(part_path),
+    ]
+    rc, _out, err = await _run(cmd, timeout)
+    if rc != 0:
+        part_path.unlink(missing_ok=True)
+        raise ExtractError(f"remux failed (ffmpeg exit {rc}): {err[-500:]}")
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(part_path, final_path)  # atomic publish
+
+
+# ---------------------------------------------------------------------------
+# Local file serving with HTTP Range support (for the on-disk remux cache)
+# ---------------------------------------------------------------------------
+
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def ranged_file_response(path: Path, range_header: str | None, media_type: str) -> Response:
+    """Serve a local file honoring `Range: bytes=...` (Starlette's FileResponse
+    does not do range handling reliably across versions, so we do it ourselves)."""
+    size = path.stat().st_size
+    headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-cache"}
+
+    if range_header:
+        m = _RANGE_RE.fullmatch(range_header.strip())
+        if not m or (not m.group(1) and not m.group(2)):
+            return PlainTextResponse(
+                "Malformed Range header", 416,
+                {"Content-Range": f"bytes */{size}"})
+        if m.group(1) == "":
+            n = int(m.group(2))
+            start, end = max(0, size - n), size - 1
+        else:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else size - 1
+            end = min(end, size - 1)
+        if start > end or start >= size:
+            return PlainTextResponse(
+                "Range Not Satisfiable", 416,
+                {"Content-Range": f"bytes */{size}"})
+
+        length = end - start + 1
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        headers["Content-Length"] = str(length)
+
+        def gen():
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(gen(), status_code=206,
+                                 media_type=media_type, headers=headers)
+
+    return FileResponse(path, media_type=media_type, headers=headers)
