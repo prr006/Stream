@@ -6,3 +6,6 @@ __pycache__/
 # Local secrets — NEVER commit these
 .env
 token.json
+
+# Extracted subtitle / probe caches (repo-root cache/ created at runtime)
+cache/

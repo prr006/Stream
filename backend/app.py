@@ -11,6 +11,7 @@ Flow:
 No Google client library is used; everything is plain HTTP via httpx so the
 mechanics (token refresh, alt=media download, Range passthrough) stay visible.
 """
+import asyncio
 import json
 import os
 import time
@@ -21,6 +22,8 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+
+import media
 
 BACKEND_DIR = Path(__file__).resolve().parent
 BASE_DIR = BACKEND_DIR.parent
@@ -41,7 +44,26 @@ SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
 FRONTEND_DIR = BASE_DIR / "frontend"
 
+# On-disk caches (drive file id keyed). Subtitles are tiny; probe json a few KB.
+CACHE_DIR = Path(os.getenv("CACHE_DIR", str(BASE_DIR / "cache")))
+PROBE_CACHE = CACHE_DIR / "probe"
+SUBS_CACHE = CACHE_DIR / "subs"
+for _d in (PROBE_CACHE, SUBS_CACHE):
+    _d.mkdir(parents=True, exist_ok=True)
+
+# Subtitle extraction reads the whole file server-side on first request.
+EXTRACT_TIMEOUT_S = int(os.getenv("EXTRACT_TIMEOUT_S", "1800"))
+
 app = FastAPI(title="Stream POC")
+
+_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock(key: str) -> asyncio.Lock:
+    """Per-resource async lock so we never run duplicate ffmpeg extractions."""
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    return _locks[key]
 
 
 # --------------------------------------------------------------------------
@@ -247,6 +269,60 @@ async def stream_video(file_id: str, request: Request):
             await client.aclose()
 
     return StreamingResponse(body(), status_code=upstream.status_code, headers=passthrough)
+
+
+# --------------------------------------------------------------------------
+# Media probing / subtitle extraction (MKV milestone)
+# --------------------------------------------------------------------------
+
+@app.get("/probe/{file_id}")
+async def probe_file(file_id: str):
+    """
+    Inspect container + streams via ffprobe/ffmpeg (reads only file headers).
+    Result is cached per file id; subtitle entries get a ready-to-use VTT url.
+    """
+    token = await require_token()
+    cache = PROBE_CACHE / f"{media._safe_id(file_id)}.json"
+
+    async with _lock(f"probe:{file_id}"):
+        if cache.exists():
+            info = json.loads(cache.read_text())
+        else:
+            try:
+                info = await media.probe_media(file_id, token, DRIVE_API_BASE)
+            except media.FFmpegMissingError as e:
+                raise HTTPException(503, str(e))
+            except media.ProbeError as e:
+                raise HTTPException(502, f"probe failed: {e}")
+            cache.write_text(json.dumps(info))
+
+    for s in info["subtitles"]:
+        s["url"] = f"/subtitles/{file_id}/{s['index']}.vtt" if s["web_compatible"] else None
+    info["playability"] = media.assess_playability(info)
+    return info
+
+
+@app.get("/subtitles/{file_id}/{stream_index}.vtt")
+async def get_subtitles(file_id: str, stream_index: int):
+    """
+    Extract one embedded subtitle track as WebVTT (cached after first call).
+
+    First extraction reads the whole file sequentially from Drive server-side
+    (MKV interleaves subtitle blocks), then the ~100KB result is cached.
+    """
+    token = await require_token()
+    async with _lock(f"sub:{file_id}:{stream_index}"):
+        try:
+            path = await media.extract_subtitle(
+                file_id, stream_index, token, DRIVE_API_BASE,
+                SUBS_CACHE, timeout=EXTRACT_TIMEOUT_S,
+            )
+        except media.FFmpegMissingError as e:
+            raise HTTPException(503, str(e))
+        except media.ExtractError as e:
+            raise HTTPException(422, str(e))
+    return FileResponse(path, media_type="text/vtt",
+                        filename=f"track{stream_index}.vtt")
 
 
 # --------------------------------------------------------------------------

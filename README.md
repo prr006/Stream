@@ -16,15 +16,18 @@ whole file first**.
 ```
 Stream/
 ├── backend/
-│   ├── app.py            # OAuth flow + /files + range-aware /stream proxy (no Google SDK, plain HTTP)
-│   ├── requirements.txt  # fastapi, uvicorn, httpx, python-dotenv
+│   ├── app.py            # OAuth + /files + range-aware /stream proxy + /probe + /subtitles
+│   ├── media.py          # ffprobe/ffmpeg stream detection + subtitle→WebVTT extraction
+│   ├── requirements.txt  # fastapi, uvicorn, httpx, python-dotenv, imageio-ffmpeg
 │   └── .env.example      # copy to .env and fill in your OAuth client credentials
 ├── frontend/
-│   └── index.html        # file picker + <video> player + seek-test buttons
+│   └── index.html        # file picker + <video> player + seek buttons + subtitle UI
 ├── tests/
-│   ├── fake_drive.py     # fake Drive upstream that serves 5 MiB with Range support
-│   └── test_range_proxy.py  # end-to-end proof that Range passthrough is byte-exact
-├── .gitignore            # ignores .env, token.json, .venv
+│   ├── fake_drive.py        # fake Drive upstream that serves bytes with Range support
+│   ├── test_range_proxy.py  # end-to-end proof that Range passthrough is byte-exact
+│   └── test_subtitles.py    # MKV probe + subtitle extraction tests (real ffmpeg round-trip)
+├── cache/                # created at runtime: probe JSON + extracted .vtt (gitignored)
+├── .gitignore            # ignores .env, token.json, .venv, cache/
 └── token.json            # created automatically after you authorize (DO NOT COMMIT — already gitignored)
 ```
 
@@ -106,12 +109,70 @@ python tests/test_range_proxy.py
 Spins up the fake Drive upstream and verifies full-body, bounded, open-ended and suffix Range
 requests come back byte-exact with `206` + `Content-Range`, plus that the auth gate returns 401.
 
+```bash
+python tests/test_subtitles.py
+```
+
+Unit-tests the ffprobe/ffmpeg stream parsers, then synthesizes a **real MKV with two embedded
+SRT tracks (eng + jpn)** using ffmpeg, serves it through the fake Drive, and verifies
+`/probe` stream detection, `/subtitles/...vtt` extraction to WebVTT, the on-disk cache,
+and the bad-stream-index error path.
+
+## 7. Milestone 2: MKV playback + embedded subtitles
+
+**Pipeline (deliberately transcode-free):**
+
+```
+browser <video>  -- Range: bytes=a-b -->  /stream/{fileId}  ------------>  Drive (unchanged, direct MKV passthrough)
+browser <track>  --------------------->  /subtokens...      cached .vtt
+any code path    --------------------->  /probe/{fileId}    ffprobe/ffmpeg reads only file headers
+```
+
+- **Video never leaves Drive's bytes untouched** — the MKV container is streamed through the
+  existing range proxy and demuxed by the browser. Zero CPU, seeks stay instant.
+  Requirement: **Chrome or Edge**, with codecs in {H.264, VP8/9, AV1} + {AAC, MP3, Opus, Vorbis, FLAC}.
+- `GET /probe/{file_id}` detects container, video/audio codecs, and embedded subtitle tracks.
+  Uses `ffprobe` JSON when installed; otherwise parses `ffmpeg -i` stderr (the bundled
+  `imageio-ffmpeg` binary works as a last resort — it has no ffprobe).
+- `GET /subtitles/{file_id}/{stream_index}.vtt` extracts one text subtitle track
+  (SubRip/ASS/WebVTT/mov_text) to **WebVTT** via `ffmpeg -map 0:{index} -c:s webvtt`.
+  Results cached in `cache/subs/`.
+- **Image-based subtitles (PGS/VobSub) are detected and shown as unsupported** — converting them
+  to text requires OCR (possible future add-on, e.g. SubtitleEdit / pgsrip).
+
+**The one real cost:** MKV interleaves subtitle packets with A/V data, so the *first* extraction
+of a (file, track) pair reads the **entire file sequentially server-side** from Drive (demux
+only, no decode — roughly the full file size against that account's daily Drive download quota).
+After that, the ~100 KB `.vtt` is served from disk instantly. Probe calls only read the header.
+
+### How to test with one of YOUR MKV files
+
+1. Install ffmpeg on your machine (optional but recommended — gives you ffprobe JSON probing):
+   - Ubuntu/Debian: `sudo apt install ffmpeg` · macOS: `brew install ffmpeg` · Windows: winget.  
+   If you skip this, the backend falls back to the pip-bundled `imageio-ffmpeg` binary.
+2. `pip install -r backend/requirements.txt` (pulls `imageio-ffmpeg` + everything else).
+3. Start the server (`uvicorn app:app --host 0.0.0.0 --port 8000 --reload` from `backend/`),
+   authorize, and click your MKV file. **Use Chrome or Edge.**
+4. The **detection panel** shows container, codecs, duration and warnings
+   (e.g. HEVC → "won't decode", AC3/DTS → "audio may be silent", PGS → "unsupported").
+5. Under **Subtitles**, check a track — the first fetch triggers server-side extraction
+   (watch the uvicorn log; it reads the whole file once, so give a 4 GB file a minute or two).
+   Subsequent toggles are instant (cached). The `.vtt` appears as standard browser-rendered cues.
+6. Verify with curl:
+   ```bash
+   curl -s http://localhost:8000/probe/<FILE_ID> | python3 -m json.tool
+   curl -si http://localhost:8000/subtitles/<FILE_ID>/2.vtt | head -12   # WEBVTT + cues
+   ```
+7. Seeking is unchanged — the video element still issues range `GET`s against `/stream/{id}`;
+   DevTools Network shows `206 Partial Content`.
+
 ## Known limitations (POC scope)
 
-- **Browser codec support applies.** The browser plays the file natively, so **MP4 (H.264 + AAC)**
-  is the safe test target. MKV in `<video>` works in Chrome/Edge when the codecs are supported
-  (H.264/VP9/AV1 + AAC/Opus), but not in Safari, and H.265/HEVC or AC3/DTS audio often won't
-  decode anywhere without server-side remux/transcode (that's a later FFmpeg step — out of POC scope).
+- **MKV playback = Chrome/Edge only.** Safest codecs: H.264/VP9/AV1 video + AAC/Opus/MP3 audio.
+  The `/probe` endpoint warns per-file: HEVC/MPEG-2 video cannot decode in browsers;
+  AC3/DTS/TrueHD audio plays silent; PGS/VobSub subtitles are image-based (need OCR).
+  Fixing any of these requires remux/transcode — deliberately out of scope (no seek-safe way
+  to do cheap on-the-fly remux without a full HLS/MSE segment pipeline).
 - **`HEAD` requests are not implemented.** Native `<video>` elements don't need them (they use
   range `GET`s), but some external players would.
 - **Drive is not a video CDN.** Seek latency is typically a few hundred ms (a fresh range request
