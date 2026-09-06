@@ -1,35 +1,47 @@
 """
-Media engine — the decision layer between "what the file is" (media.probe)
+Media engine v2 — the decision layer between "what the file is" (media.probe)
 and "how it should reach the screen".
 
-Inspired by the Jellyfin/Emby Direct Play / Direct Stream / Transcode model,
-ordered by MINIMUM intervention:
+Jellyfin/Plex-style Direct Play / Direct Stream / Transcode model, ordered by
+MINIMUM intervention (docs/ARCHITECTURE.md §6):
 
     1. direct-play       original bytes, browser decodes everything
-    2. wasm-audio        original bytes; unsupported audio decoded in-browser
-                         by WASM (client-side decoder) — nothing re-encoded
-    3. container-remux   only the container is wrong (bitstreams copied)
-    4. audio-remux       audio-only conversion to AAC (video never touched)
-    5. transcode         full video transcode — LAST RESORT (not implemented)
+    2. container-remux   only the container is wrong (bitstreams copied)
+    3. audio-transcode   video plays, audio doesn't → video copied, audio → AAC
+    4. transcode         full video transcode — LAST RESORT
 
-`decide()` is a PURE function of (probe info, client capabilities) so the whole
-matrix is unit-testable and the UI only renders the plan. Adding support for a
-codec/container = extending the tables below — pages never branch on codecs.
+v2 changes vs the POC engine (milestone 3, see docs/ARCHITECTURE-poc-m3.md):
+  * `wasm-audio` is REMOVED from the ladder (client-side WASM decode was a
+    browser workaround; the server-side audio-only transcode is the correct
+    minimum operation and is cacheable — §13 of the architecture doc).
+  * rungs 2–4 emit DASH/CMAF plans (static manifest URLs with a stable
+    `plan` id) instead of the whole-file remux job; the segment origin that
+    serves them lands in P1 (DASH_ORIGIN_ENABLED gates the `implemented` flag
+    so plans stay honest during the transition).
+  * MKV is NEVER direct-played, even when a browser claims mkv support
+    (Chrome's MKV sniffing is build/codec dependent and invisible to
+    canPlayType — exactly the instability the WASM hack existed for).
+  * Fragmented MP4 (moof in body) is not direct-playable either.
 
-Plan shape (JSON):
+`decide()` remains a PURE function of (probe info, client capabilities) so the
+whole matrix is unit-testable and the UI only renders the plan.
+
+Plan shape (JSON) — contract preserved from the POC (pages render plans,
+never codecs):
 
     {
-      "mode": "wasm-audio",
+      "mode": "audio-transcode",
       "implemented": true,
-      "reasons": ["..."],                    # human-readable, shown in UI
-      "steps": [{"stream": "container", "action": "source", ...}, ...],
-      "playback": {"url": "/stream/<id>", "mime": "video/x-matroska"},
-      "audio": {"trackIndex": 1, "codec": "ac3",
-                "action": "wasm-decode", "module": "/static/ac3-audio.js"},
-      "audioTracks": [ {...per-track chooser data...} ],
-      "probe": {...summary echo for the info panel...},
-      "subtitles": [...passthrough from /probe...],
-      "alternatives": [{"mode": "audio-remux", "implemented": true, ...}]
+      "reasons": ["..."],
+      "steps": [{"stream": "container", "action": "…", …}, …],
+      "playback": {"type": "dash", "url": "/dash/<id>/<plan>/manifest.mpd",
+                   "plan": "aac-1-und"},
+      "audio": {"trackIndex": 1, "codec": "ac3", "action": "convert-aac"},
+      "audioTracks": [ …per-track chooser data… ],
+      "subtitles": [ …passthrough from /probe… ],
+      "probe": { …summary echo… },
+      "alternatives": [ {"mode": "transcode", "implemented": true, …}, … ],
+      "implementedModes": [ … ]
     }
 """
 from __future__ import annotations
@@ -56,12 +68,12 @@ CODEC_ALIASES = {
     "dts": "dts", "dca": "dts", "truehd": "truehd", "mlp": "truehd",
 }
 
-# What the in-browser WASM decoder currently handles (ffmpeg.wasm ac3 engine).
+# Legacy reference only (P0): the in-browser WASM decoder's old coverage.
+# No longer used by the ladder — kept so old plans/captures stay explainable.
 WASM_DECODABLE_AUDIO = {"ac3", "eac3"}
 
-# Codecs the server-side AAC remux can convert (essentially anything ffmpeg
-# can decode; kept as a set so unsupported-by-ffmpeg outliers stay honest).
-REMUXABLE_AUDIO = WASM_DECODABLE_AUDIO | {
+# Audio codecs the server-side AAC conversion handles.
+CONVERTIBLE_AUDIO = WASM_DECODABLE_AUDIO | {
     "aac", "mp3", "opus", "vorbis", "flac", "dts", "truehd", "pcm_s16le",
 }
 
@@ -70,12 +82,16 @@ CONTAINER_MIME = {
     "mov": "video/quicktime", "ogg": "video/ogg",
 }
 
+# Containers the browser will NOT direct-play, even when canPlayType claims
+# otherwise (Chrome's MKV sniffing is unreliable; see module docstring).
+NO_DIRECT_CONTAINERS = {"mkv"}
+
 # --------------------------------------------------------------------------
 # Client capabilities
 # --------------------------------------------------------------------------
 
 # Conservative assumption for clients that don't report (server-side default):
-# modern desktop browser, MP4/WebM only, mainstream codecs, WASM allowed.
+# modern desktop browser, MP4/WebM only, mainstream codecs.
 DEFAULT_CAPABILITIES: dict = {
     "name": "server-default",
     "containers": {"mp4": True, "webm": True, "mkv": False, "avi": False,
@@ -123,15 +139,34 @@ def codec_key(name: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# The decision ladder
+# The decision ladder (v2)
 # --------------------------------------------------------------------------
 
-MODES_BY_PRIORITY = ["direct-play", "wasm-audio", "container-remux",
-                     "audio-remux", "transcode"]
+MODES_BY_PRIORITY = ["direct-play", "container-remux", "audio-transcode",
+                     "transcode"]
 
-# Adapters the shipped frontend/backend can actually execute right now.
-# The ladder knows the full model; this set is what V1 wires end-to-end.
-IMPLEMENTED_MODES = {"direct-play", "wasm-audio", "audio-remux"}
+# The DASH segment origin (P1) serves the remux/audio/transcode rungs.
+# Until it is enabled, those plans are emitted but flagged implemented=False
+# so clients (and the /plan debug surface) stay honest.
+DASH_ORIGIN_ENABLED: bool = False
+
+
+def implemented_modes() -> set[str]:
+    modes = {"direct-play"}
+    if DASH_ORIGIN_ENABLED:
+        modes |= {"container-remux", "audio-transcode", "transcode"}
+    return modes
+
+
+def dash_plan_id(config: str, track_index, lang: str) -> str:
+    """Stable per-(config, audio track, language) id → segment URL namespace
+    (shared across sessions/viewers; see docs §7.1)."""
+    return f"{config}-{track_index if track_index is not None else 'x'}-{lang or 'und'}"
+
+
+def _dash_playback(file_id: str, plan_id: str) -> dict:
+    return {"type": "dash", "plan": plan_id,
+            "url": f"/dash/{file_id}/{plan_id}/manifest.mpd"}
 
 
 def _audio_track_plans(tracks: list[dict], caps: dict) -> list[dict]:
@@ -145,9 +180,10 @@ def _audio_track_plans(tracks: list[dict], caps: dict) -> list[dict]:
             "language": t.get("language") or "und",
             "title": t.get("title") or "",
             "nativePlayable": native,
-            "wasmDecodable": (codec in WASM_DECODABLE_AUDIO
-                              and caps["features"]["wasmAudio"]),
-            "remuxable": codec in REMUXABLE_AUDIO,
+            # legacy field (pre-v2 WASM era) — kept for plan compatibility
+            "wasmDecodable": codec in WASM_DECODABLE_AUDIO
+            and caps["features"]["wasmAudio"],
+            "convertible": codec in CONVERTIBLE_AUDIO,
         })
     return out
 
@@ -158,10 +194,22 @@ def decide(info: dict, caps: dict | None) -> dict:
     reasons: list[str] = []
 
     container = container_key(info.get("format_name", ""))
-    container_ok = bool(caps["containers"].get(container))
-    reasons.append(
-        f"container '{info.get('format_name', '?')}' → '{container}': "
-        + ("browser can parse it" if container_ok else "browser CANNOT parse it"))
+    container_reported = bool(caps["containers"].get(container))
+    fragmented = bool(info.get("fragmented"))
+    container_direct = (container_reported
+                        and container not in NO_DIRECT_CONTAINERS
+                        and not fragmented)
+    if container in NO_DIRECT_CONTAINERS and container_reported:
+        reasons.append(f"container '{container}': browser claims support, but "
+                       "MKV sniffing is unreliable — never direct-played "
+                       "(copy-only remux instead)")
+    else:
+        reasons.append(
+            f"container '{info.get('format_name', '?')}' → '{container}': "
+            + ("direct-playable" if container_direct else "NOT directly playable"))
+    if fragmented:
+        reasons.append("fragmented MP4 (moof in body) — not progressive-"
+                       "playable; remux required")
 
     video = info.get("video")
     vcodec = codec_key(video["codec"]) if video else None
@@ -175,150 +223,169 @@ def decide(info: dict, caps: dict | None) -> dict:
 
     audio_tracks = _audio_track_plans(info.get("audio", []), caps)
 
-    # Default audio: first natively-playable, else first wasm-decodable,
-    # else first track (will need conversion).
+    # Default audio: first natively-playable track, else the first track that
+    # can be server-converted (or the first, for the transcode rung).
     chosen = next((t for t in audio_tracks if t["nativePlayable"]), None)
-    chosen_action = "native"
-    if chosen is None:
-        chosen = next((t for t in audio_tracks if t["wasmDecodable"]), None)
-        chosen_action = "wasm-decode"
     if chosen is None and audio_tracks:
-        chosen = audio_tracks[0]
-        chosen_action = "remux-aac"
+        chosen = next((t for t in audio_tracks if t["convertible"]),
+                      audio_tracks[0])
+    chosen_action = "native" if (chosen and chosen["nativePlayable"]) \
+        else "convert-aac"
 
-    playback = {"url": f"/stream/{info['file_id']}",
-                "mime": CONTAINER_MIME.get(container, "application/octet-stream")}
+    file_id = info["file_id"]
+
+    def playback_for(mode: str) -> dict:
+        if mode == "direct-play":
+            return {"type": "range", "url": f"/stream/{file_id}",
+                    "mime": CONTAINER_MIME.get(container,
+                                               "application/octet-stream")}
+        if mode == "container-remux":
+            plan = dash_plan_id("copy", chosen["index"] if chosen else None,
+                                chosen["language"] if chosen else "und")
+            return _dash_playback(file_id, plan)
+        if mode == "audio-transcode":
+            plan = dash_plan_id("aac", chosen["index"] if chosen else None,
+                                chosen["language"] if chosen else "und")
+            return _dash_playback(file_id, plan)
+        plan = dash_plan_id("h264aac", chosen["index"] if chosen else None,
+                            chosen["language"] if chosen else "und")
+        return _dash_playback(file_id, plan)
 
     plan_base = {
-        "fileId": info["file_id"],
+        "fileId": file_id,
         "capabilities": caps["name"],
         "reasons": reasons,
         "audioTracks": audio_tracks,
         "subtitles": info.get("subtitles", []),
         "probe": {
             "container": info.get("format_name", ""),
+            "containerKey": container,
             "duration": info.get("duration", 0),
-            "video": video, "probe_engine": info.get("probe_engine", "?"),
+            "size": info.get("size", 0),
+            "video": video,
+            "probe_engine": info.get("probe_engine", "?"),
             "playability": info.get("playability", {}),
+            "keyframes": (info.get("keyframes") or {}).get("source", "none"),
         },
     }
 
     def make(mode: str) -> dict:
         p = dict(plan_base)
         p["mode"] = mode
-        p["implemented"] = mode in IMPLEMENTED_MODES
-        p["playback"] = playback
+        p["implemented"] = mode in implemented_modes()
+        p["playback"] = playback_for(mode)
+        # POC contract: "audio" = chosen-track chooser data (or null).
+        actions = {"direct-play": "native", "container-remux": "copy",
+                   "audio-transcode": "convert-aac", "transcode": "transcode-aac"}
+        p["audio"] = ({"trackIndex": chosen["index"], "codec": chosen["codec"],
+                       "action": actions[mode]} if chosen else None)
         return p
 
-    chosen_mode: str
+    def steps_for(mode: str) -> list[dict]:
+        if mode == "direct-play":
+            return [
+                {"stream": "container", "action": "source",
+                 "detail": f"/stream proxies original bytes of the .{container}"},
+                {"stream": "video", "action": "native", "detail": vcodec},
+                *([{"stream": "audio", "action": "native",
+                    "detail": f"{chosen['codec']} @ track {chosen['index']}"}]
+                  if chosen else []),
+            ]
+        if mode == "container-remux":
+            return [
+                {"stream": "container", "action": "remux",
+                 "detail": "copy-only repack to DASH/CMAF — zero re-encode"},
+                {"stream": "video", "action": "copy", "detail": vcodec},
+                {"stream": "audio", "action": "copy",
+                 "detail": ", ".join(t["codec"] for t in audio_tracks) or "none"},
+            ]
+        if mode == "audio-transcode":
+            return [
+                {"stream": "container", "action": "remux",
+                 "detail": "DASH/CMAF (segments)"} if not container_direct
+                else {"stream": "container", "action": "source",
+                      "detail": container},
+                {"stream": "video", "action": "copy",
+                 "detail": f"{vcodec} bitstream untouched"},
+                {"stream": "audio", "action": "convert-aac",
+                 "detail": (f"{chosen['codec']} → AAC once (cached)"
+                            if chosen else "none")},
+            ]
+        return [
+            {"stream": "video", "action": "transcode",
+             "detail": "full re-encode (H.264) — LAST RESORT"},
+            {"stream": "audio", "action": "convert-aac",
+             "detail": "AAC"},
+        ]
 
     if not video and not audio_tracks:
         p = make("unsupported")
         p["implemented"] = False
+        p["steps"] = []
         reasons.append("no playable streams at all")
         p["alternatives"] = []
+        p["implementedModes"] = sorted(implemented_modes())
         return p
 
-    # -- priority 1: Direct Play ------------------------------------------
-    if container_ok and video_ok and (not audio_tracks or chosen_action == "native"):
-        p = make("direct-play")
-        p["steps"] = [
-            {"stream": "container", "action": "source",
-             "detail": f"/stream proxies original bytes of the .{container}"},
-            {"stream": "video", "action": "native", "detail": vcodec},
-            *( [{"stream": "audio", "action": "native",
-                 "detail": f"{chosen['codec']} @ track {chosen['index']}"}]
-               if chosen else [] ),
-        ]
-        p["audio"] = ({"trackIndex": chosen["index"], "codec": chosen["codec"],
-                       "action": "native"} if chosen else None)
+    # -- rung 1: Direct Play ----------------------------------------------
+    if container_direct and video_ok and (not audio_tracks
+                                          or chosen_action == "native"):
+        chosen_mode = "direct-play"
         reasons.insert(0, "everything playable natively — original bytes go "
                           "straight to <video> (Direct Play)")
-        chosen_mode = "direct-play"
 
-    # -- priority 2: original bytes + client-side WASM audio decode --------
-    elif container_ok and video_ok and chosen_action == "wasm-decode":
-        p = make("wasm-audio")
-        p["steps"] = [
-            {"stream": "container", "action": "source",
-             "detail": "original bytes; mediabunny demuxes in-browser"},
-            {"stream": "video", "action": "native", "detail": vcodec},
-            {"stream": "audio", "action": "wasm-decode",
-             "detail": f"{chosen['codec']} decoded by ffmpeg.wasm → Web Audio"},
-        ]
-        p["audio"] = {"trackIndex": chosen["index"], "codec": chosen["codec"],
-                      "action": "wasm-decode", "module": "/static/ac3-audio.js"}
-        reasons.insert(0, "video plays directly; the browser can't decode "
-                          f"'{chosen['codec']}' so the WASM engine decodes it "
-                          "from the SAME original bytes (no re-encode)")
-        chosen_mode = "wasm-audio"
-
-    # -- priority 3: container remux (bitstreams copied) --------------------
-    elif not container_ok and video_ok and all(
-            t["nativePlayable"] for t in audio_tracks):
-        p = make("container-remux")
-        p["steps"] = [
-            {"stream": "container", "action": "remux",
-             "detail": "rewrap into MP4/fMP4 — bitstreams COPIED, zero re-encode"},
-            {"stream": "video", "action": "copy", "detail": vcodec},
-            {"stream": "audio", "action": "copy",
-             "detail": ", ".join(t["codec"] for t in audio_tracks) or "none"},
-        ]
-        p["audio"] = None
-        reasons.insert(0, "codecs are fine — only the container is incompatible; "
-                          "a copy-only remux is the minimum intervention")
+    # -- rung 2: container remux (all streams OK, container wrong) ---------
+    elif video_ok and all(t["nativePlayable"] for t in audio_tracks):
         chosen_mode = "container-remux"
+        reasons.insert(0, "codecs play natively — only the container is "
+                          "incompatible; a copy-only remux is the minimum "
+                          "intervention (no re-encode)")
 
-    # -- priority 4: audio-only conversion ----------------------------------
-    elif container_ok and video_ok and chosen and chosen_action == "remux-aac" \
-            and chosen.get("remuxable", True):
-        p = make("audio-remux")
-        p["steps"] = [
-            {"stream": "container", "action": "source", "detail": container},
-            {"stream": "video", "action": "copy", "detail": vcodec},
-            {"stream": "audio", "action": "remux-aac",
-             "detail": "server-side one-time AAC conversion; video bitstream untouched"},
-        ]
-        p["audio"] = {"trackIndex": chosen["index"], "codec": chosen["codec"],
-                      "action": "remux-aac",
-                      "startUrl": f"/remux/{info['file_id']}",
-                      "statusUrl": f"/remux/{info['file_id']}/status",
-                      "urlTemplate": f"/remux/{info['file_id']}.mkv"}
-        reasons.insert(0, "container and video are fine; audio "
-                          f"'{chosen['codec']}' isn't decodable in-browser and is "
-                          "outside the WASM scope — one-time audio→AAC remux")
-        chosen_mode = "audio-remux"
+    # -- rung 3: audio-only transcode (video OK, audio needs conversion) ---
+    elif video_ok and audio_tracks and chosen_action == "convert-aac":
+        chosen_mode = "audio-transcode"
+        reasons.insert(0,
+                       f"video '{vcodec}' plays natively and is copied "
+                       f"untouched; audio '{chosen['codec']}' is not "
+                       "decodable in this browser — one-time AAC conversion "
+                       "(cached; this replaces any manual 'audio fix')")
 
+    # -- rung 4: full transcode (video itself unplayable) ------------------
     else:
-        # container bad AND something else bad → composed direct-stream …
-        # ── or the last resort ──────────────────────────────────────────────
-        p = make("transcode")
-        p["steps"] = [
-            {"stream": "video", "action": "transcode",
-             "detail": "full re-encode — LAST RESORT, not implemented"},
-        ]
-        p["audio"] = None
-        reasons.insert(0, "no combination of the cheaper modes can play this — "
-                          "full video transcode is the last resort")
         chosen_mode = "transcode"
+        reasons.insert(0, "the video codec itself is not decodable in this "
+                          "browser — full transcode (H.264 + AAC), the last "
+                          "resort")
 
-    # -- alternatives: any OTHER implemented mode that would also work ------
+    p = make(chosen_mode)
+    p["steps"] = steps_for(chosen_mode)
+
+    # -- alternatives: other implemented rungs that would also work ---------
+    # (client fallback chain if the chosen rung fails at runtime, e.g. an MSE
+    #  codec surprise; ordered cheapest-first)
+    candidates = []
+    if video_ok and all(t["nativePlayable"] for t in audio_tracks):
+        candidates.append("container-remux")
+    if video_ok and audio_tracks:
+        candidates.append("audio-transcode")
+    if video:
+        candidates.append("transcode")
+    implemented = implemented_modes()
     alternatives = []
-    for alt_mode in MODES_BY_PRIORITY:
-        if alt_mode == chosen_mode or alt_mode not in IMPLEMENTED_MODES:
+    for m in candidates:
+        if m == chosen_mode or m not in implemented:
             continue
-        if alt_mode == "direct-play":
-            continue  # would have been chosen if it worked
-        if alt_mode == "audio-remux" and container_ok and video_ok \
-                and any(t["remuxable"] for t in audio_tracks):
-            alternatives.append({
-                "mode": "audio-remux",
-                "implemented": True,
-                "label": "AAC-remux fallback (server converts audio once)",
-                "startUrl": f"/remux/{info['file_id']}",
-                "statusUrl": f"/remux/{info['file_id']}/status",
-                "urlTemplate": f"/remux/{info['file_id']}.mkv",
-            })
+        alt_playback = playback_for(m)
+        alternatives.append({
+            "mode": m,
+            "implemented": True,
+            "label": {
+                "container-remux": "copy-only remux (no re-encode)",
+                "audio-transcode": "video copy + AAC audio",
+                "transcode": "full transcode (H.264 + AAC)",
+            }[m],
+            "playback": alt_playback,
+        })
     p["alternatives"] = alternatives
-    p["implementedModes"] = sorted(IMPLEMENTED_MODES)
+    p["implementedModes"] = sorted(implemented_modes())
     return p

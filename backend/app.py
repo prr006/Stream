@@ -14,6 +14,8 @@ mechanics (token refresh, alt=media download, Range passthrough) stay visible.
 import asyncio
 import json
 import os
+import random
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -21,11 +23,13 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import engine
 import media
+import plancache
+import rangecache
 
 BACKEND_DIR = Path(__file__).resolve().parent
 BASE_DIR = BACKEND_DIR.parent
@@ -53,6 +57,23 @@ SUBS_CACHE = CACHE_DIR / "subs"
 REMUX_DIR = CACHE_DIR / "remux"
 for _d in (PROBE_CACHE, SUBS_CACHE, REMUX_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+# RangeCache (docs/ARCHITECTURE.md §11): chunked LRU cache of Drive bytes
+# behind /stream. 0 (default) = disabled → exact POC passthrough behavior.
+RANGE_CACHE_MAX_BYTES = int(os.getenv("RANGE_CACHE_MAX_BYTES", "0"))
+RANGE_CACHE_DIR = Path(os.getenv("RANGE_CACHE_DIR", str(CACHE_DIR / "range")))
+range_cache = rangecache.RangeCache(RANGE_CACHE_DIR, RANGE_CACHE_MAX_BYTES)
+
+# P0.4: dash-origin rungs are addressable from plans; the /dash/* routes
+# themselves land in P1. Toggle so plans can carry the flag honestly.
+DASH_ORIGIN_ENABLED = os.getenv("DASH_ORIGIN_ENABLED", "0") == "1"
+engine.DASH_ORIGIN_ENABLED = DASH_ORIGIN_ENABLED
+
+# In-memory Drive file-metadata cache (version key + size), short TTL.
+_drive_meta: dict[str, tuple[float, dict]] = {}
+DRIVE_META_TTL_S = 300.0
+
+_SINGLE_RANGE_RE = re.compile(r"\s*bytes=(\d*)-(\d*)\s*")
 
 # Subtitle extraction reads the whole file server-side on first request.
 EXTRACT_TIMEOUT_S = int(os.getenv("EXTRACT_TIMEOUT_S", "1800"))
@@ -200,6 +221,99 @@ async def require_token() -> str:
     return token
 
 
+async def drive_file_meta(token: str, file_id: str) -> dict | None:
+    """
+    File metadata for the RangeCache (version key + total size). Cached for a
+    short TTL; a re-upload changes modifiedTime/md5Checksum, so stale entries
+    age out within minutes at worst.
+    """
+    now = time.time()
+    hit = _drive_meta.get(file_id)
+    if hit and now - hit[0] < DRIVE_META_TTL_S:
+        return hit[1]
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{DRIVE_API_BASE}/files/{file_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"fields": "id,md5Checksum,modifiedTime,size,mimeType"},
+                timeout=30.0,
+            )
+        if resp.status_code != 200:
+            return None
+        meta = resp.json()
+    except httpx.HTTPError:
+        return None
+    if not meta.get("size"):
+        return None
+    _drive_meta[file_id] = (now, meta)
+    return meta
+
+
+def file_version(meta: dict) -> str:
+    return str(meta.get("md5Checksum") or meta.get("modifiedTime")
+               or "unversioned")
+
+
+def parse_single_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """'bytes=a-b' / 'bytes=a-' / 'bytes=-n' → (start, end), or None."""
+    m = _SINGLE_RANGE_RE.fullmatch(header or "")
+    if not m:
+        return None
+    s, e = m.group(1), m.group(2)
+    if s == "" and e == "":
+        return None
+    if s == "":  # suffix range: last n bytes
+        n = int(e)
+        if n == 0:
+            return None
+        return max(0, size - n), size - 1
+    start = int(s)
+    end = int(e) if e else size - 1
+    if start >= size:
+        return None
+    return start, min(end, size - 1)
+
+
+async def fetch_drive_chunk(token: str, file_id: str, start: int, end: int) -> bytes | None:
+    """
+    One RangeCache chunk fetch from Drive, with bounded exponential backoff on
+    403 (userRateLimitExceeded) / 429 — the documented Drive retry contract.
+    Returns None when the chunk cannot be fetched (caller falls through to
+    passthrough / surfaces an error).
+    """
+    for delay in (0, 1, 2, 4):
+        if delay:
+            await asyncio.sleep(delay + random.random() * 0.25)
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=30.0),
+            ) as client:
+                req = client.build_request(
+                    "GET",
+                    f"{DRIVE_API_BASE}/files/{file_id}",
+                    params={"alt": "media", "acknowledgeAbuse": "true"},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept-Encoding": "identity",
+                        "Range": f"bytes={start}-{end}",
+                    },
+                )
+                upstream = await client.send(req, stream=True)
+                try:
+                    if upstream.status_code in (403, 429):
+                        continue  # rate limited — back off and retry
+                    if upstream.status_code >= 400:
+                        return None
+                    return await upstream.aread()  # ≤ 8 MiB — safe to buffer
+                finally:
+                    await upstream.aclose()
+        except httpx.HTTPError:
+            continue
+    return None
+
+
 @app.get("/files")
 async def list_videos():
     """List video files visible to the authorized account."""
@@ -232,14 +346,64 @@ async def stream_video(file_id: str, request: Request):
     The browser <video> element sends `Range: bytes=start-end` requests as the
     user seeks/buffers. We forward that header to Drive's alt=media endpoint
     and stream the (206 Partial Content) response back verbatim.
+
+    When the RangeCache is enabled (RANGE_CACHE_MAX_BYTES > 0), a satisfiable
+    single-range request is served from the chunked local cache first; on any
+    miss or error we fall through to the plain passthrough below, so caching
+    can never break playback.
     """
     token = await require_token()
+    range_header = request.headers.get("range")
 
+    # Ranges this large bypass the in-memory cached path (streamed upstream).
+    MAX_CACHED_RANGE = 64 * 1024 * 1024
+
+    if not range_cache.disabled and range_header and "," not in range_header:
+        meta = await drive_file_meta(token, file_id)
+        if meta:
+            size = int(meta["size"])
+            rng = parse_single_range(range_header, size)
+            if rng is None:
+                return PlainTextResponse(
+                    "Range Not Satisfiable", 416,
+                    headers={"Content-Range": f"bytes */{size}",
+                             "Accept-Ranges": "bytes"})
+            start, end = rng
+            if end - start + 1 > MAX_CACHED_RANGE:
+                return await _passthrough_stream(token, file_id, range_header)
+            version = file_version(meta)
+
+            async def fetch(cs, ce):
+                return await fetch_drive_chunk(token, file_id, cs, min(ce, size - 1))
+
+            try:
+                body = await range_cache.get_range(file_id, version, start, end, fetch)
+            except rangecache.RangeFetchError:
+                body = None  # fall through to passthrough
+            if body is not None:
+                return Response(
+                    body, status_code=206,
+                    headers={
+                        "Content-Type": meta.get("mimeType", "application/octet-stream"),
+                        "Content-Range": f"bytes {start}-{end}/{size}",
+                        "Content-Length": str(len(body)),
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-cache",
+                    })
+
+    return await _passthrough_stream(token, file_id, range_header)
+
+
+async def _passthrough_stream(token: str, file_id: str, range_header: str | None):
+    """
+    The POC's original Range passthrough, unchanged in behavior: forward the
+    Range header to Drive's alt=media endpoint and stream the response back
+    verbatim.
+    """
     upstream_headers = {
         "Authorization": f"Bearer {token}",
         "Accept-Encoding": "identity",  # never gzip: Range must map to raw bytes
     }
-    range_header = request.headers.get("range")
     if range_header:
         upstream_headers["Range"] = range_header
 
@@ -329,7 +493,27 @@ async def media_plan_default(file_id: str):
     """Plan against the conservative server-side default capabilities
     (handy for curl/debugging; browsers should POST their real matrix)."""
     info = await _load_probe(file_id)
-    return engine.decide(info, None)
+    return _plan_with_cache(file_id, info, None)
+
+
+def _plan_with_cache(file_id: str, info: dict, caps: dict | None):
+    """
+    Cached decide() (docs/ARCHITECTURE.md §6.2): a plan is a pure function of
+    (file version, client class, language) — compute once, reuse until TTL.
+    The cache can never change the decision, only skip recomputation.
+    (File-version invalidation lands with Drive md5Checksum wiring in P1;
+    until then the key uses an empty version — still correct, just less
+    aggressive.)
+    """
+    audio = info.get("audio") or []
+    lang = (audio[0].get("language") or "und") if audio else "und"
+    k = plancache.key(file_id, "", caps, lang)
+    cached = plancache.load(CACHE_DIR, k)
+    if cached is not None:
+        return cached
+    plan = engine.decide(info, caps)
+    plancache.store(CACHE_DIR, k, plan)
+    return plan
 
 
 @app.post("/media/{file_id}/plan")
@@ -337,7 +521,7 @@ async def media_plan(file_id: str, request: Request):
     """
     The ONE entry point pages call: browser posts its measured capability
     matrix, the engine answers with the minimum-intervention playback plan
-    (direct-play → wasm-audio → container-remux → audio-remux → transcode).
+    (direct-play → container-remux → audio-transcode → transcode).
     Pages render/adapt to the plan; they never branch on codecs themselves.
     """
     try:
@@ -345,7 +529,7 @@ async def media_plan(file_id: str, request: Request):
     except Exception:
         caps = None
     info = await _load_probe(file_id)
-    return engine.decide(info, caps)
+    return _plan_with_cache(file_id, info, caps)
 
 
 @app.get("/subtitles/{file_id}/{stream_index}.vtt")
@@ -439,6 +623,20 @@ def remux_file(file_id: str, request: Request):
                  "then poll /remux/{file_id}/status.")
     return media.ranged_file_response(
         final, request.headers.get("range"), "video/x-matroska")
+
+
+# --------------------------------------------------------------------------
+# Ops / debug
+# --------------------------------------------------------------------------
+
+@app.get("/api/debug")
+def debug_info():
+    """Cache/queue health for the playback-mode debug UI (docs §8)."""
+    return {
+        "dash_origin_enabled": DASH_ORIGIN_ENABLED,
+        "range_cache": range_cache.stat(),
+        "remux_jobs": {k: v for k, v in list(REMUX_JOBS.items())[-20:]},
+    }
 
 
 # --------------------------------------------------------------------------
