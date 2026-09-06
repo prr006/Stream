@@ -25,8 +25,9 @@ async def build_keyframe_index(info: dict, fetch, file_size: int) -> dict:
     info  — normalized probe dict (needs format_name)
     fetch — async (start, end) -> bytes, inclusive, clamped to file size
     """
-    out = {"source": "none", "count": 0, "times": [], "error": None,
-           "moov_position": None, "fragmented": False, "encrypted": False}
+    out = {"source": "none", "count": 0, "times": [], "clusters": None,
+           "error": None, "moov_position": None, "fragmented": False,
+           "encrypted": False}
     if not file_size:
         out["error"] = "no file size known"
         return out
@@ -44,10 +45,11 @@ async def build_keyframe_index(info: dict, fetch, file_size: int) -> dict:
             elif r["count"]:
                 out["error"] = "implausible keyframe times (clock skew?)"
         elif container == "mkv":
-            times = await boxparse.parse_mkvcues(fetch, file_size)
+            times, clusters = await boxparse.parse_mkvcues(fetch, file_size)
             if times and times[-1] < MAX_INDEX_TIME_S:
                 out["source"] = "cues"
                 out["times"] = times
+                out["clusters"] = clusters
                 out["count"] = len(times)
     except Exception as e:  # noqa: BLE001 — the index is best-effort by design
         out["error"] = str(e)[:200]

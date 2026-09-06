@@ -48,13 +48,20 @@ def ffmpeg_bin() -> str:
     return ff
 
 
-def make_sample(ff: str, fmt: str, extra: list[str], out: Path) -> None:
+def make_sample(ff: str, fmt: str, extra: list[str], out: Path,
+                subs: Path | None = None) -> None:
     cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
            "-f", "lavfi", "-i", "testsrc=duration=5:size=320x240:rate=30",
-           "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
-           "-c:v", "libx264", "-preset", "ultrafast",
-           "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
-           "-c:a", "aac", "-b:a", "64k"] + extra + [str(out)]
+           "-f", "lavfi", "-i", "sine=frequency=440:duration=5"]
+    if subs is not None:
+        cmd += ["-i", str(subs)]
+    cmd += ["-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
+            "-c:a", "aac", "-b:a", "64k"]
+    if subs is not None:
+        cmd += ["-map", "2:s:0", "-c:s", "srt"]
+    cmd += extra + [str(out)]
     r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
         raise RuntimeError(f"sample generation failed ({fmt}):\n{r.stderr.decode()[-500:]}")
@@ -89,9 +96,17 @@ def main() -> int:
     mp4 = tmp / "sample.mp4"          # moov at end (ffmpeg default)
     mp4_fast = tmp / "sample_fast.mp4"  # moov at start
     mkv = tmp / "sample.mkv"
+    srt = tmp / "subs.srt"
+    # Subtitle cues deliberately at 1.000 s (== a video keyframe time —
+    # the two tracks then share one CuePoint) and at 2.500 s (not a
+    # keyframe — must never leak into the video grid).
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n\n"
+                   "2\n00:00:02,500 --> 00:00:03,000\nworld\n")
+    mkv_multi = tmp / "multi.mkv"
     make_sample(ff, "mp4", [], mp4)
     make_sample(ff, "mp4-fast", ["-movflags", "+faststart"], mp4_fast)
     make_sample(ff, "mkv", ["-f", "matroska"], mkv)
+    make_sample(ff, "mkv-multi", ["-f", "matroska"], mkv_multi, subs=srt)
 
     # --- MP4, moov at end -------------------------------------------------------
     data = mp4.read_bytes()
@@ -124,6 +139,22 @@ def main() -> int:
     check("mkv: keyframe grid ≈ 0,1,2,3,4 s",
           expect_keyframe_grid(idx["times"]), str(idx["times"]))
 
+    # --- MKV with video+audio+subtitle cues (multi-track Cues) -----------------
+    data = mkv_multi.read_bytes()
+    idxm = asyncio.run(keyframes.build_keyframe_index(
+        {"format_name": "matroska,webm"}, mem_fetcher(data), len(data)))
+    check("mkv-multi: source=cues", idxm["source"] == "cues",
+          f"source={idxm['source']} err={idxm['error']}")
+    check("mkv-multi: video grid 0..4s only (subtitle cues at 1.0/2.5 excluded)",
+          expect_keyframe_grid(idxm["times"])
+          and not any(close_enough(t, 2.5) for t in idxm["times"]),
+          str(idxm["times"]))
+    check("mkv-multi: cluster offsets align with keyframes",
+          idxm["clusters"] is not None
+          and len(idxm["clusters"]) == len(idxm["times"])
+          and all(c is not None for c in idxm["clusters"]),
+          str(idxm["clusters"]))
+
     # --- direct boxparse entry points (unit level) ---------------------------------
     async def direct():
         # MP4 moov parse from raw bytes
@@ -131,16 +162,19 @@ def main() -> int:
         r = await boxparse.analyze_mp4(mem_fetcher(d), len(d))
         # MKV cues parse
         d2 = mkv.read_bytes()
-        t = await boxparse.parse_mkvcues(mem_fetcher(d2), len(d2))
+        t, tc = await boxparse.parse_mkvcues(mem_fetcher(d2), len(d2))
         # garbage
         d3 = bytes(64 * 1024)
         r3 = await boxparse.analyze_mp4(mem_fetcher(d3), len(d3))
-        t3 = await boxparse.parse_mkvcues(mem_fetcher(d3), len(d3))
-        return r, t, r3, t3
+        t3, _ = await boxparse.parse_mkvcues(mem_fetcher(d3), len(d3))
+        return r, t, r3, t3, tc
 
-    r, t, r3, t3 = asyncio.run(direct())
+    r, t, r3, t3, tc = asyncio.run(direct())
     check("boxparse: mp4 direct parse finds keyframes", r["count"] >= 4, str(r))
     check("boxparse: mkv direct parse finds cues", bool(t) and len(t) >= 4, str(t))
+    check("boxparse: mkv cluster offsets align with keyframes",
+          tc is not None and len(tc) == len(t) and all(c is not None for c in tc),
+          str((len(t) if t else 0, len(tc) if tc else None)))
     check("boxparse: garbage → source none, no exception",
           r3["count"] == 0 and t3 is None)
 

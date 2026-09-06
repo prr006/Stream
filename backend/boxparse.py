@@ -262,14 +262,24 @@ async def analyze_mp4(fetch, file_size: int) -> dict:
 # MKV (EBML)
 # --------------------------------------------------------------------------
 
-CUES_ID = b"\x1c\x53\xbb\x6b"
+CUES_ID = 0x1C53BB6B
+CUES_ID_BYTES = b"\x1c\x53\xbb\x6b"
 CUEPOINT_ID = 0xBB
 CUETIME_ID = 0xB3
 CUE_TRACK_POSITIONS_ID = 0xB7
-CUE_TRACK_NUMBER_ID = 0xB0
+CUE_TRACK_ID = 0xF7          # IETF v4 "CueTrack" (the track number)
+CUE_TRACK_ID_LEGACY = 0xB0   # pre-IETF "CueTrackNumber"
+CUE_CLUSTER_POS_ID = 0xF1    # CueClusterPosition (absolute Segment Position)
 
-# EBML/matroska default TimecodeScale: 1 000 000 ns = 1 ms per cue unit.
-_TIMESCALE_NS = 1_000_000
+INFO_ID_BYTES = b"\x15\x49\xa9\x66"
+TIMESTAMP_SCALE_ID = 0x2AD7B1  # TimestampScale (ns per tick; default 1 ms)
+TRACKS_ID_BYTES = b"\x16\x54\xae\x6b"
+TRACK_ENTRY_ID = 0xAE
+TRACK_NUMBER_ID = 0xD7
+TRACK_TYPE_ID = 0x83
+TRACK_TYPE_VIDEO = 1
+
+_TIMESCALE_NS_DEFAULT = 1_000_000  # 1 ms — the spec default
 
 
 def _ebml_id(data: bytes, i: int) -> tuple[int, int, int]:
@@ -333,15 +343,87 @@ def _vint(data: bytes, i: int) -> tuple[int, int]:
     return val, i + length
 
 
-def _try_parse_cues(data: bytes, file_size: int) -> list[float] | None:
+def _parse_tracks(head: bytes) -> dict[int, int]:
+    """
+    head of the file → {TrackNumber: TrackType} (1=video, 2=audio,
+    17=subtitle …). {} when the Tracks element isn't in the window.
+    """
+    for m in re.finditer(re.escape(TRACKS_ID_BYTES), head):
+        c = m.start()
+        try:
+            esize, j = _vint(head, c + 4)
+            end = j + esize
+            if end > len(head):
+                continue
+            out: dict[int, int] = {}
+            k = j
+            while k + 2 < end:
+                tid, tlen, k2 = _ebml_id(head, k)
+                tsize, k3 = _vint(head, k2)
+                tend = k3 + tsize
+                if tend > end:
+                    break
+                if tid == TRACK_ENTRY_ID:
+                    num = typ = None
+                    p = k3
+                    while p + 2 < tend:
+                        eid, elen, p2 = _ebml_id(head, p)
+                        esz, p3 = _vint(head, p2)
+                        if p3 + esz > tend:
+                            break
+                        if eid == TRACK_NUMBER_ID:
+                            num = int.from_bytes(head[p3:p3 + esz], "big")
+                        elif eid == TRACK_TYPE_ID:
+                            typ = int.from_bytes(head[p3:p3 + esz], "big")
+                        p = p3 + esz
+                    if num is not None and typ is not None:
+                        out[num] = typ
+                k = tend
+            if out:
+                return out
+        except (ValueError, IndexError):
+            continue
+    return {}
+
+
+def _parse_timescale(head: bytes) -> int:
+    """Info/TimestampScale (ns per tick); spec default 1 000 000."""
+    for m in re.finditer(re.escape(INFO_ID_BYTES), head):
+        c = m.start()
+        try:
+            esize, j = _vint(head, c + 4)
+            end = j + esize
+            if end > len(head):
+                continue
+            k = j
+            while k + 2 < end:
+                eid, elen, k2 = _ebml_id(head, k)
+                esz, k3 = _vint(head, k2)
+                if k3 + esz > end:
+                    break
+                if eid == TIMESTAMP_SCALE_ID:
+                    v = int.from_bytes(head[k3:k3 + esz], "big")
+                    if 1 <= v <= 10**9:
+                        return v
+                k = k3 + esz
+            break  # the first Info is enough
+        except (ValueError, IndexError):
+            continue
+    return _TIMESCALE_NS_DEFAULT
+
+
+def _try_parse_cues(data: bytes, track_map: dict[int, int],
+                    timescale_ns: int) -> tuple[list[float] | None,
+                                                list[int | None] | None]:
     """
     Look for a Cues element inside `data` (a tail window of the file, whose
     last byte is the file's last byte). Walks its children generically so
     unknown/leading elements are skipped rather than fatal.
 
-    Returns video-track keyframe times (seconds), or None.
+    → (video keyframe times in seconds, cluster offsets for each keyframe)
+    or (None, None). Cluster offsets power the cue-aware subtitle fast path.
     """
-    candidates = [m.start() for m in re.finditer(re.escape(CUES_ID), data)]
+    candidates = [m.start() for m in re.finditer(re.escape(CUES_ID_BYTES), data)]
     for c in reversed(candidates):  # prefer the one at the file tail
         try:
             esize, j = _vint(data, c + 4)
@@ -354,7 +436,7 @@ def _try_parse_cues(data: bytes, file_size: int) -> list[float] | None:
             if end < len(data) - 4:
                 continue
 
-            cue_times: dict[int, list[int]] = {}
+            cue_tracks: dict[int, list[tuple[int, int | None]]] = {}
             k = j
             while k + 2 < end:
                 pid, idlen, k2 = _ebml_id(data, k)
@@ -363,8 +445,12 @@ def _try_parse_cues(data: bytes, file_size: int) -> list[float] | None:
                 if pend > end:
                     break
                 if pid == CUEPOINT_ID:
+                    # A CuePoint may carry several CueTrackPositions — one
+                    # per track that has a cue at this time (e.g. video
+                    # keyframe + subtitle cue at the same second). Each is
+                    # recorded independently.
                     t: int | None = None
-                    track: int | None = None
+                    pairs: list[tuple[int | None, int | None]] = []
                     m = k3
                     while m + 2 < pend:
                         eid, elen, m2 = _ebml_id(data, m)
@@ -374,48 +460,68 @@ def _try_parse_cues(data: bytes, file_size: int) -> list[float] | None:
                         if eid == CUETIME_ID:
                             t = int.from_bytes(data[m3:m3 + esz], "big")
                         elif eid == CUE_TRACK_POSITIONS_ID:
+                            track = cluster = None
                             q = m3
                             while q + 2 < m3 + esz:
                                 tid, tlen, q2 = _ebml_id(data, q)
                                 tsz, q3 = _vint(data, q2)
                                 if q3 + tsz > m3 + esz:
                                     break
-                                if tid == CUE_TRACK_NUMBER_ID:
-                                    track = int.from_bytes(data[q3:q3 + tsz], "big")
+                                if tid in (CUE_TRACK_ID, CUE_TRACK_ID_LEGACY):
+                                    track = int.from_bytes(
+                                        data[q3:q3 + tsz], "big")
+                                elif tid == CUE_CLUSTER_POS_ID:
+                                    cluster = int.from_bytes(
+                                        data[q3:q3 + tsz], "big")
                                 q = q3 + tsz
+                            pairs.append((track, cluster))
                         m = m3 + esz
-                    if t is not None and 0 <= t < 10**7:
-                        # Some muxers omit CueTrackNumber; group those cues
-                        # under one default track.
-                        cue_times.setdefault(track if track is not None else 0,
-                                             []).append(t)
+                    if t is not None and 0 <= t < 10**7 and pairs:
+                        for track, cluster in pairs:
+                            # Some muxers omit the track number; group
+                            # those cues under one default track.
+                            cue_tracks.setdefault(
+                                track if track is not None else 0,
+                                []).append((t, cluster))
                 k = pend
-            if not cue_times:
+            if not cue_tracks:
                 continue
-            # Video track = the one with the most cue points (one per
-            # keyframe; audio/subtitle tracks have far fewer or none).
-            track = max(cue_times, key=lambda t: len(cue_times[t]))
-            times = sorted(x * _TIMESCALE_NS / 1e9 for x in cue_times[track])
-            if times:
-                return times
+            # Video track = TrackType video when the track map is known;
+            # otherwise the track with the most cue points.
+            video = [t for t in cue_tracks
+                     if track_map.get(t) == TRACK_TYPE_VIDEO]
+            if not video:
+                video = [max(cue_tracks, key=lambda t: len(cue_tracks[t]))]
+            pts = sorted(cue_tracks[video[0]])
+            if not pts:
+                continue
+            times = [round(x * timescale_ns / 1e9, 4) for x, _ in pts]
+            clusters = [c for _, c in pts]
+            return times, clusters
         except (ValueError, IndexError):
             continue
-    return None
+    return None, None
 
 
 async def parse_mkvcues(fetch, file_size: int,
-                        max_window: int = 16 * 1024 * 1024) -> list[float] | None:
+                        max_window: int = 16 * 1024 * 1024
+                        ) -> tuple[list[float] | None, list[int | None] | None]:
     """
-    Fetch the file tail in expanding windows until the Cues element is found.
-    Returns video-track keyframe times (seconds), or None.
+    Fetch a small head window (Tracks + Info) and the file tail in expanding
+    windows until the Cues element is found.
+    Returns (video keyframe times in seconds, cluster offsets), or (None, None).
     """
+    head = await fetch(0, min(file_size, 256 * 1024) - 1)
+    track_map = _parse_tracks(head) if head else {}
+    timescale = _parse_timescale(head) if head else _TIMESCALE_NS_DEFAULT
+
     window = min(file_size, 4 * 1024 * 1024)
     while True:
         base = file_size - window
         data = await fetch(base, file_size - 1)
-        times = _try_parse_cues(data, file_size)
+        times, clusters = _try_parse_cues(data, track_map, timescale)
         if times is not None:
-            return times
+            return times, clusters
         if window >= file_size or window >= max_window:
-            return None
+            return None, None
         window = min(file_size, window * 4)
